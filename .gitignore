@@ -1,0 +1,6 @@
+trip_secret.txt
+id_secret.txt
+global.mem
+*.tmp*
+config.php
+admin_fail.mem
