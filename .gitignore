@@ -4,3 +4,4 @@ global.mem
 *.tmp*
 config.php
 admin_fail.mem
+__pycache__/

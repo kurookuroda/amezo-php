@@ -12,14 +12,34 @@ Python 版 (`amezo.py` / `dai.py`) の PHP 移植。スレッドは今までど�
 | `admin.php` | 管理画面 (`/admin.cgi` もここに向く): レス削除、スレッドの非表示・復元 |
 | `router.php` | `php -S` 用。許可リスト方式で静的ファイルを配る |
 | `hide.js` | ID / トリップの非表示 (ブラウザの localStorage だけで動く) |
-| `run.sh` | 板フォルダを作って `php -S` を起動 (`PORT` `WORKERS` で変更可) |
+| `setup_expose.py` | Colab 用の起動スクリプト (PHP の導入、板フォルダ作成、`php -S`、Cloudflare Tunnel での公開) |
+| `run.sh` | ローカル用 (板フォルダを作って `php -S` を起動。`PORT` `WORKERS` で変更可) |
 | `tests/` | Python 版との突き合わせ、結合テスト、メモリ測定 |
 
 ## 動かす
 
+### Colab (setup_expose.py)
+
+```python
+%cd /content/amezo-php                                  # このフォルダを置いた場所
+!python3 setup_expose.py --make-hash 合言葉              # 管理画面のパスワードを delpass.txt に作る (最初の1回)
+!python3 setup_expose.py                                 # 起動。表示された https://….trycloudflare.com/ が公開URL
+```
+
+起動のたびに、PHP 8.1 以上と mbstring が無ければ apt で入れ、古い php / cloudflared を止め、`blist.txt` の板フォルダを作り、`php -S router.php` と Cloudflare Tunnel を起動する。
+起動直後に自己チェックを出す (板一覧は 200、`trip_secret.txt` `delpass.txt` `lib.php` などは 404 になっていること)。
+停止はセルの停止 (または Ctrl+C)。
+
+- **置き場所はローカルディスク (`/content` など) にする。** Google Drive のマウント上では `flock` が効かないことがあり、起動時に警告を出す。
+  Colab のディスクはセッションが切れると消えるので、`trip_secret.txt` `id_secret.txt` と板フォルダは必要に応じて Drive にコピーしておく。
+  鍵が消えると、全員のトリップと ID が変わる。
+- 接続元の IP は、Cloudflare が付ける `CF-Connecting-IP` から取る (`127.0.0.1` からの接続のときだけ信用する)。
+- `--no-tunnel` でローカルだけ、`--port` `--workers` `--verbose` で調整できる。
+
+### ローカル (run.sh)
+
 ```sh
 sh run.sh                 # http://127.0.0.1:8000/
-# Colab: 別セルで cloudflared tunnel --url http://127.0.0.1:8000
 ```
 
 ## 設定
@@ -75,4 +95,4 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
 
 - 既存スレッドに `hide.js` を入れる処理 (新しいスレッドと index にだけ入る)。
 - `>>数字` のアンカーと連鎖あぼーん (今は `>>` を `>` に畳む仕様)。
-- nginx + PHP-FPM、Colab 上、cloudflared 経由での実行 (テストは PHP 8.3 + `php -S` だけ)。
+- Colab 上での実行、PHP 8.1、実際の cloudflared 経由のアクセス (テストは PHP 8.3 + `php -S` + `--no-tunnel` だけ)。nginx + PHP-FPM も未確認。
