@@ -15,6 +15,8 @@
 #     !python3 setup_expose.py                         # 起動 (Ctrl+C / セルの停止で止まる)
 #   ローカルで試すだけ (トンネルなし):
 #     python3 setup_expose.py --no-tunnel
+#   メモリを節約したいとき (起動後に、このランチャー自身は終了して、PHP とトンネルだけを残す):
+#     !python3 setup_expose.py --detach        # 止めるとき: !pkill -x php; pkill -x cloudflared
 
 import argparse
 import fcntl
@@ -107,6 +109,41 @@ def ensure_php():
     return False
 
 
+REQUIRED_FUNCS = ["ctype_digit", "ctype_xdigit", "filter_var", "inet_pton", "hash_hmac", "hash_pbkdf2", "hash_equals",
+                  "random_bytes", "mb_check_encoding", "mb_convert_encoding", "mb_scrub", "mb_chr", "mb_ord", "mb_substr",
+                  "preg_match_all", "flock", "stream_copy_to_stream", "tmpfile"]
+
+
+def php_runtime_args(trim=True):
+    """
+    php に渡す起動引数。
+    trim=True のときは php.ini を読まず (-n)、必要な拡張 (mbstring, ctype) だけを読み込む。
+    余計な拡張 (約20個) を読み込まないぶん、常駐メモリが 5MB ほど減る。
+    必要な関数が1つでも欠けるときは、安全のため通常の起動 (空の引数) に戻す。
+    """
+    limit = ["-d", "memory_limit=32M"]       # 想定外の入力でメモリを使い切らないための上限 (5MBのスレッドでも 3MB で足りる)
+    if not trim:
+        return limit
+    try:
+        ext_dir = subprocess.run(["php", "-r", 'echo ini_get("extension_dir");'], capture_output=True, text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return limit
+    args = ["-n"]
+    for ext in ("mbstring", "ctype"):
+        so = os.path.join(ext_dir, ext + ".so")
+        if os.path.exists(so):
+            args += ["-d", f"extension={so}"]
+    check = "foreach (" + "[" + ",".join(f'"{f}"' for f in REQUIRED_FUNCS) + "] as $f) if (!function_exists($f)) { echo $f; exit(1); }"
+    try:
+        r = subprocess.run(["php", *args, "-r", check], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return limit
+    if r.returncode != 0:
+        print(f"  ℹ️ 拡張を絞った起動は使えません ({r.stdout.strip() or '確認に失敗'} が無い)。通常の起動にします。")
+        return limit
+    return args + limit
+
+
 # ---- 事前チェックと準備 -------------------------------------------------------
 
 def check_flock():
@@ -181,14 +218,18 @@ def cleanup_old_processes(port):
 
 # ---- Web サーバー (php -S) ------------------------------------------------------
 
-def start_php_server(port, workers, verbose=False):
-    print(f"🚀 PHP Webサーバーを起動しています (ポート {port}, ワーカー {workers})...")
+def start_php_server(port, workers, verbose=False, detach=False, trim=True):
+    runtime = php_runtime_args(trim)
+    note = "拡張を絞って" if "-n" in runtime else "通常の設定で"
+    print(f"🚀 PHP Webサーバーを起動しています ({note}、ポート {port}, ワーカー {workers})...")
     env = dict(os.environ, PHP_CLI_SERVER_WORKERS=str(workers))
-    proc = subprocess.Popen(
-        ["php", "-S", f"127.0.0.1:{port}", "router.php"],
-        cwd=BASE_DIR, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
+    cmd = ["php", *runtime, "-S", f"127.0.0.1:{port}", "router.php"]
+    if detach:
+        # ランチャーが終わってもサーバーが残るように、別セッションで起動してログはファイルへ
+        log = open("php.log", "ab")
+        return subprocess.Popen(cmd, cwd=BASE_DIR, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    proc = subprocess.Popen(cmd, cwd=BASE_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
     def read_output():
         for line in iter(proc.stdout.readline, ""):
@@ -241,27 +282,56 @@ def self_check(port):
 
 # ---- トンネルによる外部公開 -------------------------------------------------------
 
-def start_tunnel(port):
-    print("☁️ Cloudflare Tunnel をセットアップしています...")
-    if not shutil.which("cloudflared"):
-        print("cloudflared をダウンロード中...")
-        os.system("curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared")
-        os.system("chmod +x cloudflared")
-        cloudflared_bin = "./cloudflared"
-    else:
-        cloudflared_bin = "cloudflared"
+def ensure_cloudflared():
+    if shutil.which("cloudflared"):
+        return "cloudflared"
+    print("cloudflared をダウンロード中...")
+    os.system("curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared")
+    os.system("chmod +x cloudflared")
+    return "./cloudflared"
 
-    proc = subprocess.Popen(
-        [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{port}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
+
+URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+
+def print_public_url(url):
+    print(f"\n🎉 【BBSアクセス先URL】: {url}/")
+    print(f"   管理画面: {url}/admin.cgi\n")
+
+
+def start_tunnel(port, detach=False):
+    print("☁️ Cloudflare Tunnel をセットアップしています...")
+    cloudflared_bin = ensure_cloudflared()
+    cmd = [cloudflared_bin, "tunnel", "--url", f"http://127.0.0.1:{port}"]
+
+    if detach:
+        # ログをファイルに書かせ、そこから公開URLを探す。ランチャーが終わってもトンネルは残る
+        log_path = os.path.join(BASE_DIR, "cloudflared.log")
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        print("⏳ トンネルの公開URLを取得しています...")
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    m = URL_RE.search(f.read())
+            except OSError:
+                m = None
+            if m:
+                print_public_url(m.group(0))
+                return proc
+            time.sleep(1)
+        print("❌ 公開URLの取得に失敗しました。cloudflared.log を確認してください。")
+        return proc
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     url_event = threading.Event()
     public_url = [""]
 
     def read_output():
         for line in iter(proc.stdout.readline, ""):
             print(f"[CF_OUT] {line.strip()}")
-            m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+            m = URL_RE.search(line)
             if m and not public_url[0]:
                 public_url[0] = m.group(0)
                 url_event.set()
@@ -270,8 +340,7 @@ def start_tunnel(port):
 
     print("⏳ トンネルの公開URLを取得しています...")
     if url_event.wait(timeout=30):
-        print(f"\n🎉 【BBSアクセス先URL】: {public_url[0]}/")
-        print(f"   管理画面: {public_url[0]}/admin.cgi\n")
+        print_public_url(public_url[0])
     else:
         print("❌ 公開URLの取得に失敗しました。トンネルプロセスの出力を確認してください。")
     return proc
@@ -287,6 +356,9 @@ def main():
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--workers", type=int, default=WORKERS)
     ap.add_argument("--verbose", action="store_true", help="PHP サーバーの接続ログも全部出す")
+    ap.add_argument("--detach", action="store_true",
+                    help="起動できたらランチャーは終了し、PHP とトンネルだけを残す (メモリ節約。ログは php.log / cloudflared.log)")
+    ap.add_argument("--no-trim", action="store_true", help="PHP の拡張を絞らず、通常の設定で起動する")
     args = ap.parse_args()
 
     # __file__ が無い環境 (Jupyter/Colab) では os.getcwd() を使う
@@ -304,8 +376,9 @@ def main():
     cleanup_old_processes(args.port)
     setup_bbs_directories()
 
-    php_proc = start_php_server(args.port, args.workers, args.verbose)
+    php_proc = start_php_server(args.port, args.workers, args.verbose, args.detach, not args.no_trim)
     tunnel_proc = None
+    keep_running = False
 
     def stop(*_):
         raise KeyboardInterrupt
@@ -319,7 +392,13 @@ def main():
         if args.no_tunnel:
             print(f"\n🏠 ローカルで起動しました: http://127.0.0.1:{args.port}/\n")
         else:
-            tunnel_proc = start_tunnel(args.port)
+            tunnel_proc = start_tunnel(args.port, args.detach)
+
+        if args.detach:
+            keep_running = True
+            print("✅ ランチャーは終了します。PHP" + ("" if tunnel_proc is None else " とトンネル") + "は動き続けます。")
+            print("   止めるとき: !pkill -x php; pkill -x cloudflared    ログ: php.log / cloudflared.log")
+            return 0
 
         print("⏳ サーバー稼働中... 停止するには Ctrl+C (Colab ではセルの停止) を押してください。")
         while True:
@@ -333,10 +412,11 @@ def main():
     except KeyboardInterrupt:
         print("\n🛑 終了シグナルを検知しました。プロセスを停止します...")
     finally:
-        for p in (tunnel_proc, php_proc):
-            if p is not None and p.poll() is None:
-                p.terminate()
-        print("✅ プロセスを停止しました。")
+        if not keep_running:
+            for p in (tunnel_proc, php_proc):
+                if p is not None and p.poll() is None:
+                    p.terminate()
+            print("✅ プロセスを停止しました。")
     return 0
 
 

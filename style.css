@@ -18,3 +18,4 @@ form.post .links a { margin-right: 0.8em; white-space: nowrap; }
 .abone dd, .abone dt font { display: none; }
 .abone dt::after { content: " あぼーん"; color: gray; }
 .hidebtns a { font-size: x-small; margin-left: 0.4em; white-space: nowrap; }
+.pager a, .pager b { margin: 0 0.25em; }

@@ -186,7 +186,11 @@ function admin_list_threads(string $folder): array
 {
     $active = [];
     $hidden = [];
-    foreach (@scandir("./$folder") ?: [] as $n) {
+    $d = @opendir("./$folder");
+    if (!$d) return [[], []];
+    while (($n = readdir($d)) !== false) {           // 1つずつ読む (退避済みの o〜.html が何万本あっても配列に溜めない)
+        $c = $n[0] ?? '';
+        if ($c !== 'x' && !($c >= '0' && $c <= '9')) continue;
         if (!preg_match('/^(x?)(\d+)\.html$/', $n, $m)) continue;
         $path = "./$folder/$n";
         $mt = @filemtime($path);
@@ -194,6 +198,7 @@ function admin_list_threads(string $folder): array
         if ($m[1] !== '') $hidden[] = [$mt, $m[2], $path];
         else $active[] = [$mt, $m[2], $path];
     }
+    closedir($d);
     $cmp = static fn(array $a, array $b): int => [$b[0], $b[1]] <=> [$a[0], $a[1]];
     usort($active, $cmp);
     usort($hidden, $cmp);
@@ -401,7 +406,7 @@ function do_restore(string $folder, string $res): array
 /** 板の index を作り直す。戻り値は補足メッセージ (問題なければ空) */
 function regen(string $folder): string
 {
-    [, $status] = regen_index($folder, 21, false, false);
+    [, $status] = regen_index($folder, 1, false, false);
     return $status === 'done' ? '' : ' (他の処理が再生成中のため、板の一覧の更新は省略されました)';
 }
 

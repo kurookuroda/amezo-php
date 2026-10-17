@@ -93,10 +93,18 @@ function amezo_main(): void
     if ($res !== '' && !preg_match('/^\d*$/', $res)) bbs_error('不正なスレッド指定です');
     if (isset($form['sub']) && $form['sub'] !== '') res_view($folder, $form);
 
-    $next_val = $form['next'] ?? '1';
-    if (!preg_match('/^\d{1,6}$/', $next_val)) $next_val = '1';
-    $next_int = max(1, (int)$next_val) + 20;
-    $next_int = min($next_int, 1021);          // 「次のページ」のファイルが増えすぎないように
+    // ページ送り (?page=3)。POST でも GET でも受ける。実在するページにだけ飛ぶ (範囲外は最後のページ)。
+    // 古い index に残っている「次のページ」の欄 (next=N番目から) も、そのページに読み替えて受ける
+    $page_raw = $form['page'] ?? (is_string($_GET['page'] ?? null) ? $_GET['page'] : '');
+    $next_raw = $form['next'] ?? (is_string($_GET['next'] ?? null) ? $_GET['next'] : '');
+    if (preg_match('/^\d{1,6}$/', $page_raw)) {
+        $page = (int)$page_raw;
+    } elseif (preg_match('/^\d{1,6}$/', $next_raw)) {
+        $page = intdiv(max(1, (int)$next_raw) - 1, PAGE_SIZE) + 1;
+    } else {
+        $page = 1;
+    }
+    $page = page_clamp($folder, $page);
 
     $reload = false;
     if ($name === $subj && $name === $comm) $reload = true;
@@ -118,8 +126,7 @@ function amezo_main(): void
 
     // ---- NG ワード (name/comm/mail/subj はエスケープ済みなので、ワードもエスケープして照合する) ----
     if (is_file('./ng.txt')) {
-        foreach (file('./ng.txt', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
-            $line = rtrim($line, "\r");
+        foreach (ng_lines() as $line) {
             if ($line === '') continue;
             $parts = explode(',', $line);
             $ng = html_escape($parts[0]);
@@ -139,7 +146,7 @@ function amezo_main(): void
     }
 
     // ---- 投稿 ---------------------------------------------------------------
-    if ($next_int === 21 && !$reload) {
+    if ($page === 1 && !$reload) {
         // キャップ (cap.txt の名前とパスワードに一致したとき) は、管理者名の置き換えをしない
         $cap_ok = is_cap($name, $trip_pw);
         if (!$cap_ok) $name = str_replace(ADMIN, '＃' . ADMIN, $name);     // 管理者名偽装防止
@@ -224,6 +231,6 @@ function amezo_main(): void
         touch_lasttime($folder);
     }
 
-    [$index_name] = regen_index($folder, $next_int, $reload);
+    [$index_name] = regen_index($folder, $page, $reload);
     redirect($folder, $index_name);
 }

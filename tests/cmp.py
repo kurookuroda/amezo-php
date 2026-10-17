@@ -6,6 +6,9 @@ def norm(t):
     t = t.replace('<script src="../hide.js" defer></script>', '')
     t = re.sub(r'\d{12}', 'TID', t)
     t = re.sub(r'\((?:Python|PHP) Version\)', '(X Version)', t)
+    t = re.sub(r'<!-- AMEZO-NEXT \d+ -->\n', '', t)      # PHP 版では出さない (ページごとに別ファイルにしたため)
+    # Python 版の「次のページ」入力欄は、PHP 版ではページ送り (pager) に置き換えた
+    t = re.sub(r'<form method=post action="../amezo.cgi">\n<input type=submit value="次のページ">\n<input type=text name="next" value="\d+" size="3">〜</form>\n', '', t)
     return t
 bad = 0
 def cmp(a, b, label):

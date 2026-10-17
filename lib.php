@@ -49,6 +49,7 @@ const ID_LEN        = 8;           // ID の長さ
 const TRIP_PASS_MAX = 100;         // トリップのパスワードの最大文字数
 const TRIP_MARK     = '◆';
 const CAP_MARK      = '★';
+const PAGE_SIZE     = 20;          // 1ページに本文を出すスレッド数 (1ページ目は index.html、k ページ目は index<k>.html)
 
 // ---- ファイル名 -----------------------------------------------------------
 const TRIP_SECRET_FILE = 'trip_secret.txt';
@@ -235,6 +236,17 @@ function is_cap(string $name_escaped, string $password): bool
     }
     fclose($fp);
     return $ok;
+}
+
+/** ng.txt を1行ずつ返す (全体を配列にしない)。行末の改行は除く */
+function ng_lines(): Generator
+{
+    $fp = @fopen('./ng.txt', 'r');
+    if (!$fp) return;
+    while (($line = fgets($fp)) !== false) {
+        yield rtrim($line, "\r\n");
+    }
+    fclose($fp);
 }
 
 function load_delcrypt(): string
@@ -426,14 +438,18 @@ function append_kako_list(string $folder, array $items): bool
 /** 今ある o数字.html から kako.txt を作り直す (kako.txt が無いときの1回だけ)。更新日時の古い順 */
 function rebuild_kako_list(string $folder, array $names): bool
 {
-    $items = [];
-    foreach ($names as $name) $items[] = [sprintf('%011d', (int)@filemtime("./$folder/$name")), $name];
-    sort($items);
-    $buf = '';
-    foreach ($items as [, $name]) $buf .= $name . KAKO_SEP . read_thread_title("./$folder/$name") . "\n";
+    $keys = [];
+    foreach ($names as $name) $keys[] = sprintf('%011d', (int)@filemtime("./$folder/$name")) . ' ' . $name;
+    sort($keys);                                            // 更新日時の古い順 (同じなら名前順)
     $path = "./$folder/" . KAKO_LIST;
     $tmp = $path . '.tmp' . getmypid();
-    if (@file_put_contents($tmp, $buf) === false) return false;
+    $W = @fopen($tmp, 'w');
+    if (!$W) return false;
+    foreach ($keys as $k) {                                 // 溜めずに1行ずつ書く
+        $name = substr($k, 12);
+        fwrite($W, $name . KAKO_SEP . read_thread_title("./$folder/$name") . "\n");
+    }
+    fclose($W);
     @chmod($tmp, 0644);
     if (!@rename($tmp, $path)) {
         @unlink($tmp);
@@ -442,19 +458,32 @@ function rebuild_kako_list(string $folder, array $names): bool
     return true;
 }
 
+/** ファイルを末尾から1行ずつ返す (新しい順に読みたいが、全体をメモリに載せたくないとき用) */
+function reverse_lines(string $path): Generator
+{
+    $fp = @fopen($path, 'r');
+    if (!$fp) return;
+    $pos = (int)filesize($path);
+    $carry = '';
+    while ($pos > 0) {
+        $n = min(65536, $pos);
+        $pos -= $n;
+        fseek($fp, $pos);
+        $lines = explode("\n", (string)fread($fp, $n) . $carry);
+        $carry = (string)array_shift($lines);               // 欠けている先頭の行は、さらに前の塊とつなげる
+        for ($i = count($lines) - 1; $i >= 0; $i--) {
+            if ($lines[$i] !== '') yield $lines[$i];
+        }
+    }
+    if ($carry !== '') yield $carry;
+    fclose($fp);
+}
+
 /** 過去ログの一覧 板/kako.html を kako.txt から作る (新しい退避が上)。失敗しても投稿は止めない */
 function write_kako(string $folder, string $body_tag, string $title0, string $amezo_name, string $suffix, string $title): void
 {
-    $fp = @fopen("./$folder/" . KAKO_LIST, 'r');
-    if (!$fp) return;
-    $entries = [];
-    while (($line = fgets($fp)) !== false) {
-        $p = explode(KAKO_SEP, rtrim($line, "\r\n"), 2);
-        if (count($p) === 2 && preg_match('/^o\d+\.html$/', $p[0])) $entries[] = $p;   // 壊れた行は読み飛ばす
-    }
-    fclose($fp);
-    $entries = array_reverse($entries);
-
+    $list = "./$folder/" . KAKO_LIST;
+    if (!is_file($list)) return;
     $kako_path = "./$folder/" . KAKO_FILE;
     $tmp = $kako_path . '.tmp' . getmypid();
     $W = @fopen($tmp, 'w');
@@ -467,8 +496,11 @@ function write_kako(string $folder, string $body_tag, string $title0, string $am
         . COPYRIGHT . "\n{$body_tag}\n"
         . "<font size=+2>{$title}{$amezo_name}{$suffix} 過去ログ</font>\n"
         . '<div class="row links"><a href="./">板へ戻る</a></div>' . "\n<font size=2>\n");
-    foreach ($entries as $i => [$name, $ttl]) {
-        fwrite($W, ' ' . ($i + 1) . "<a href=\"$name\">$ttl</a>\n");
+    $i = 0;
+    foreach (reverse_lines($list) as $line) {                // 新しい退避が上。全部は読み込まない
+        $p = explode(KAKO_SEP, $line, 2);
+        if (count($p) !== 2 || !preg_match('/^o\d+\.html$/', $p[0])) continue;   // 壊れた行は読み飛ばす
+        fwrite($W, ' ' . (++$i) . "<a href=\"{$p[0]}\">{$p[1]}</a>\n");
     }
     fwrite($W, "</font>\n<hr></body></html>\n");
     fclose($W);
@@ -513,35 +545,90 @@ function thread_excerpt(string $path): ?array
     return [$first, $tail, $rest];
 }
 
+// ---- ページ送り ---------------------------------------------------------------
+
+/** 表示中のスレッド数 (ファイル名を1つずつ見て数える。退避済みの大量のファイルがあっても配列に溜めない) */
+function count_threads(string $folder): int
+{
+    $d = @opendir("./$folder");
+    if (!$d) return 0;
+    $n = 0;
+    while (($f = readdir($d)) !== false) {
+        if (($f[0] ?? '') >= '0' && ($f[0] ?? '') <= '9' && preg_match('/^\d+\.html$/', $f)) $n++;
+    }
+    closedir($d);
+    return MAX_THREADS > 0 ? min($n, MAX_THREADS) : $n;
+}
+
+function page_count(int $threads): int
+{
+    return max(1, intdiv($threads + PAGE_SIZE - 1, PAGE_SIZE));
+}
+
+/** ページ番号を、実在するページ (1〜最後のページ) に直す。範囲外は最後のページ */
+function page_clamp(string $folder, int $page): int
+{
+    if ($page <= 1) return 1;
+    return min($page, page_count(count_threads($folder)));
+}
+
+/** ページ送りのリンク。1ページしか無いときは何も出さない。11ページ以上のときは現在のページの前後だけ */
+function pager_html(string $folder, int $cur, int $pages): string
+{
+    if ($pages <= 1) return '';
+    $href = static fn(int $p): string => $p === 1
+        ? './'
+        : '../amezo.cgi?folder=' . rawurlencode($folder) . '&amp;page=' . $p;
+
+    $nums = [];
+    $last = 0;
+    for ($p = 1; $p <= $pages; $p++) {
+        if ($pages > 10 && $p !== 1 && $p !== $pages && abs($p - $cur) > 2) continue;
+        if ($last && $p - $last > 1) $nums[] = '…';
+        $nums[] = $p === $cur ? "<b>[{$p}]</b>" : '<a href="' . $href($p) . '">' . $p . '</a>';
+        $last = $p;
+    }
+    $segments = [];
+    if ($cur > 1) $segments[] = '<a href="' . $href($cur - 1) . '">← 前の' . PAGE_SIZE . '件</a>';   // 1ページ目には出さない
+    $segments[] = implode(' ', $nums);
+    if ($cur < $pages) $segments[] = '<a href="' . $href($cur + 1) . '">次の' . PAGE_SIZE . '件 →</a>'; // 最後のページには出さない
+    return '<div class="row links pager">' . implode('　', $segments) . "</div>\n";
+}
+
 // ---- インデックス再生成 (amezo.php の投稿処理と admin.php の両方から使う) -------
 
-/** 年月日順に並べたスレッド一覧 [[ts, 'N.html'], ...] (新しい順) と、退避済みのファイル名 */
-function list_threads(string $folder): array
+/**
+ * 表示中のスレッド一覧 [[ts, 'N.html'], ...] (更新の新しい順) と、退避済みのファイル名を返す。
+ * 退避済みの名前は、過去ログ一覧を作り直すとき ($collect_old = true) だけ集める (何万本あっても普段は溜めない)。
+ */
+function list_threads(string $folder, bool $collect_old = false): array
 {
     $files = [];
     $old = [];
-    $d = @scandir("./$folder");
-    if ($d === false) return [[], []];
-    foreach ($d as $f) {
-        if (preg_match('/^\d+\.html$/', $f)) {
+    $d = @opendir("./$folder");
+    if (!$d) return [[], []];
+    while (($f = readdir($d)) !== false) {
+        $c = $f[0] ?? '';
+        if ($c === 'o') {
+            if ($collect_old && preg_match('/^o\d+\.html$/', $f)) $old[] = $f;
+        } elseif ($c >= '0' && $c <= '9' && preg_match('/^\d+\.html$/', $f)) {
             $files[] = [sprintf('%011d', (int)@filemtime("./$folder/$f")), $f];
-        } elseif (preg_match('/^o\d+\.html$/', $f)) {
-            $old[] = $f;
         }
     }
+    closedir($d);
     // 更新日時の新しい順。同じ秒のときはファイル名の新しい順 (並びを毎回同じにするため)
     usort($files, static fn(array $a, array $b): int => [$b[0], $b[1]] <=> [$a[0], $a[1]]);
     return [$files, $old];
 }
 
 /**
- * 板の index.html (next_int != 21 のときは index<next_int>.html) を再生成する。
+ * 板の index.html (2ページ目以降は index<ページ番号>.html) を再生成する。
  * 戻り値: [ファイル名, 状態]  状態: 'done' / 'cached' / 'busy'
  */
-function regen_index(string $folder, int $next_int = 21, bool $reload = false, bool $use_cache = true): array
+function regen_index(string $folder, int $page = 1, bool $reload = false, bool $use_cache = true): array
 {
     [$color, $title] = board_line($folder) ?? ['', ''];
-    $page_name = $next_int !== 21 ? "index{$next_int}.html" : 'index.html';
+    $page_name = $page > 1 ? "index{$page}.html" : 'index.html';
     $index_path = "./$folder/$page_name";
     $suffix = $folder === 'main' ? '(メイン)' : '';
 
@@ -567,14 +654,14 @@ function regen_index(string $folder, int $next_int = 21, bool $reload = false, b
         clearstatcache(true, $index_path);
         $mt = @filemtime($index_path);
         if ($mt !== false) {
-            if ($next_int === 21 && $reload && POST_INTERVAL > 0 && time() - $mt < POST_INTERVAL) return [$page_name, 'cached'];
-            if ($next_int !== 21 && PAGE_CACHE > 0 && time() - $mt < PAGE_CACHE) return [$page_name, 'cached'];
+            if ($page === 1 && $reload && POST_INTERVAL > 0 && time() - $mt < POST_INTERVAL) return [$page_name, 'cached'];
+            if ($page > 1 && PAGE_CACHE > 0 && time() - $mt < PAGE_CACHE) return [$page_name, 'cached'];
         }
     }
 
     // 1ページ目だけロックする (退避と過去ログ一覧の更新があるため)。他のページはファイルごとに独立
     $lk = null;
-    if ($next_int === 21) {
+    if ($page === 1) {
         $lk = @fopen("./$folder/regen.lock", 'c');
         if (!$lk) bbs_error('ロックファイルを作成できません.');
         $locked = false;
@@ -592,6 +679,35 @@ function regen_index(string $folder, int $next_int = 21, bool $reload = false, b
         }
     }
 
+    // スレッド一覧 (退避は1ページ目の再生成のときだけ)
+    $need_old = $page === 1 && kako_list_size($folder) <= 0;       // 過去ログ一覧を作り直すときだけ、退避済みの名前を集める
+    [$files, $old_names] = list_threads($folder, $need_old);
+    $retired_now = [];
+    if (MAX_THREADS > 0 && count($files) > MAX_THREADS) {
+        if ($page === 1) {
+            foreach (array_slice($files, MAX_THREADS) as [$ts, $f]) {
+                if (!file_exists("./$folder/o$f") && @rename("./$folder/$f", "./$folder/o$f")) {
+                    $retired_now[] = [$ts, "o$f"];
+                }
+            }
+        }
+        $files = array_slice($files, 0, MAX_THREADS);
+    }
+
+    $kako_changed = false;
+    if ($page === 1) {
+        if (kako_list_size($folder) <= 0) {
+            if ($old_names || $retired_now) {
+                $kako_changed = rebuild_kako_list($folder, array_merge($old_names, array_column($retired_now, 1)));
+            }
+        } elseif ($retired_now) {
+            $kako_changed = append_kako_list($folder, $retired_now);
+        }
+    }
+    $has_kako = kako_list_size($folder) > 0;
+
+    $pager = pager_html($folder, $page, page_count(count($files)));
+
     $tmp_path = $index_path . '.tmp' . getmypid();
     $W = @fopen($tmp_path, 'w');
     if (!$W) bbs_error('indexを書き込めません.');
@@ -608,45 +724,16 @@ function regen_index(string $folder, int $next_int = 21, bool $reload = false, b
         $h = @file_get_contents('./header.html');
         if ($h !== false) fwrite($W, $h);
     }
-    $next_form = "<form method=post action=\"../amezo.cgi\">\n"
-        . "<input type=submit value=\"次のページ\">\n"
-        . "<input type=text name=\"next\" value=\"{$next_int}\" size=\"3\">〜</form>\n";
-    fwrite($W, $next_form . "<font size=2>\n<!-- HEAD LINE -->\n");
+    fwrite($W, $pager . "<font size=2>\n<!-- HEAD LINE -->\n");
 
-    // スレッド一覧 (退避は1ページ目の再生成のときだけ)
-    [$files, $old_names] = list_threads($folder);
-    $retired_now = [];
-    if (MAX_THREADS > 0 && count($files) > MAX_THREADS) {
-        if ($next_int === 21) {
-            foreach (array_slice($files, MAX_THREADS) as [$ts, $f]) {
-                if (!file_exists("./$folder/o$f") && @rename("./$folder/$f", "./$folder/o$f")) {
-                    $retired_now[] = [$ts, "o$f"];
-                }
-            }
-        }
-        $files = array_slice($files, 0, MAX_THREADS);
-    }
-
-    $kako_changed = false;
-    if ($next_int === 21) {
-        if (kako_list_size($folder) <= 0) {
-            if ($old_names || $retired_now) {
-                $kako_changed = rebuild_kako_list($folder, array_merge($old_names, array_column($retired_now, 1)));
-            }
-        } elseif ($retired_now) {
-            $kako_changed = append_kako_list($folder, $retired_now);
-        }
-    }
-    $has_kako = kako_list_size($folder) > 0;
-
-    $start = $next_int - 21;
+    $start = ($page - 1) * PAGE_SIZE;
     $excerpts = [];
     for ($i = $start; $i < $start + 100 && $i < count($files); $i++) {
         $f_name = $files[$i][1];
         $ex = thread_excerpt("./$folder/$f_name");
         $ttl = ($ex && preg_match('/<b>([^<]*)<\/b>/', $ex[0], $m)) ? $m[1] : '';
         fwrite($W, ' ' . ($i + 1) . "<a href=\"$f_name\">$ttl</a>\n");
-        if ($i < $next_int - 1) $excerpts[$i] = $ex;       // 本文を出すのは20件だけ
+        if ($i < $start + PAGE_SIZE) $excerpts[$i] = $ex;  // 本文を出すのは1ページ分だけ
     }
     fwrite($W, "<!-- HEAD LINE END -->\n</font>\n");
     if ($has_kako) fwrite($W, '<div class="row links"><a href="' . KAKO_FILE . '">過去ログ</a></div>' . "\n");
@@ -678,7 +765,7 @@ function regen_index(string $folder, int $next_int = 21, bool $reload = false, b
         fwrite($W, '</font></td></tr></table>' . "\n" . reply_form($res_id, $links) . "<hr>\n");
     }
 
-    fwrite($W, $next_form . "<hr></body></html>\n");
+    fwrite($W, $pager . "<hr></body></html>\n");
     fclose($W);
 
     // 元の index ファイルに置き換え
@@ -690,7 +777,7 @@ function regen_index(string $folder, int $next_int = 21, bool $reload = false, b
     }
 
     // 過去ログ一覧 (kako.html): 題名の一覧が変わったとき、またはまだ無いときだけ作り直す
-    if ($next_int === 21) {
+    if ($page === 1) {
         if ($has_kako && ($kako_changed || !file_exists("./$folder/" . KAKO_FILE))) {
             write_kako($folder, "<body{$bg_attr} bgcolor=\"{$color}\"{$text_attr}>", $title0, $amezo_name, $suffix, $title);
         }
