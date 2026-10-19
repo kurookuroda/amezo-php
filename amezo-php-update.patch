@@ -1,0 +1,1302 @@
+From 4915fe3c68953fbc0391f41e7116bde25849cb1c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 23:33:47 +0000
+Subject: [PATCH] =?UTF-8?q?=E9=8D=B5=E3=81=A4=E3=81=8D=E3=82=B9=E3=83=AC?=
+ =?UTF-8?q?=E3=83=83=E3=83=89(=E8=AA=8D=E8=A8=BC=E3=82=AD=E3=83=BC)?=
+ =?UTF-8?q?=E3=80=81URL=20=E3=81=AE=E5=88=87=E3=82=8A=E5=87=BA=E3=81=97?=
+ =?UTF-8?q?=E3=81=AE=E4=BF=AE=E6=AD=A3=E3=80=81=E7=BD=B2=E5=90=8D=E3=81=A4?=
+ =?UTF-8?q?=E3=81=8D=E4=B8=AD=E7=B6=99=E3=83=9A=E3=83=BC=E3=82=B8=E3=82=92?=
+ =?UTF-8?q?=E8=BF=BD=E5=8A=A0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+認証キー (鍵つきスレッド)
+- 管理画面 (admin.php) から、スレッドに鍵をかける/外す、キーを発行/失効できる
+- 鍵つきスレッドへの書き込みには認証キーが要る (読むのは誰でも可)。既定は鍵なし
+- 鍵の印は <板>/<スレ番号>.lock、キーの一覧は <板>/keys.txt (HMAC のみ保存、key_secret.txt の鍵)
+- 鍵の確認と返信フォームの書き込みを、スレッドのファイルロックの中で行う
+- 過去ログへの退避のとき .lock も消す
+
+URL のリンク化 (linkify_urls)
+- ASCII の URL 文字だけを URL とみなす (直後の日本語、<…>、"…"、末尾の句読点を巻き込まない)
+- http:evil や javascript: はリンクにしない。href は属性用に正しくエスケープする
+
+署名つきの中継ページ (jump.php)
+- 投稿の URL を、HMAC 署名つきの /jump.cgi 経由のリンクにする (新規の投稿のみ)
+- 署名が合う URL だけを表示し、自動では転送しない。noindex/no-referrer/CSP
+- 広告枠は ad.html があるときだけ、sandbox の iframe で表示
+- jump_secret.txt を失うと、投稿済みの中継リンクが開けなくなる (バックアップ対象)
+
+その他
+- router.php に /jump.cgi と /ad.html、setup_expose.py の起動チェックに jump 関連を追加
+- tests: lock_test.py / lock_retire.php / jump_test.py を追加、unit.php と cmp.py を更新
+---
+ .gitignore            |   4 +
+ README.md             |  56 +++++++-
+ admin.php             |  67 +++++++++-
+ amezo.php             |  45 +++----
+ jump.php              |  93 +++++++++++++
+ lib.php               | 302 ++++++++++++++++++++++++++++++++++++++++--
+ router.php            |   4 +-
+ setup_expose.py       |   7 +-
+ tests/cmp.py          |   8 +-
+ tests/jump_test.py    | 108 +++++++++++++++
+ tests/lock_retire.php |  19 +++
+ tests/lock_test.py    | 147 ++++++++++++++++++++
+ tests/unit.php        | 103 ++++++++++++++
+ 13 files changed, 917 insertions(+), 46 deletions(-)
+ create mode 100644 jump.php
+ create mode 100644 tests/jump_test.py
+ create mode 100644 tests/lock_retire.php
+ create mode 100644 tests/lock_test.py
+
+diff --git a/.gitignore b/.gitignore
+index 8cc3ac1..dbedc45 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,3 +5,7 @@ global.mem
+ config.php
+ admin_fail.mem
+ __pycache__/
++key_secret.txt
++keys.txt
++*.lock
++jump_secret.txt
+diff --git a/README.md b/README.md
+index a2f3e62..dd53753 100644
+--- a/README.md
++++ b/README.md
+@@ -9,6 +9,7 @@ Python 版 (`amezo.py` / `dai.py`) の PHP 移植。スレッドは今までど
+ | `lib.php` | 共通部品 (エスケープ、文字数、鍵、トリップ、ID、ハッシュ、index 再生成、過去ログ) |
+ | `amezo.php` | 投稿の受付 (`/amezo.cgi` もここに向く) |
+ | `dai.php` | 板一覧 (`/dai.cgi` もここに向く) |
++| `jump.php` | 外部サイトへの中継ページ (`/jump.cgi` もここに向く)。署名つきの URL だけを表示する |
+ | `admin.php` | 管理画面 (`/admin.cgi` もここに向く): レス削除、スレッドの非表示・復元 |
+ | `router.php` | `php -S` 用。許可リスト方式で静的ファイルを配る |
+ | `hide.js` | ID / トリップの非表示 (ブラウザの localStorage だけで動く) |
+@@ -83,6 +84,51 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ - 1番のレスは削除できない (スレッドごと消すときは「非表示」)。削除したあと、スレッドの更新日時は「残った最後のレスの日時」に戻す。
+ - 非表示は `x数字.html` にリネーム (権限 0600、配信されない)。復元で戻せる。
+ - レス一覧に ID の列を足してある (荒らしの見分け用)。
++- スレッドごとの鍵 (認証キー) の管理は、次の「鍵つきスレッド」を参照。
++
++## 外部リンクの中継ページ
++
++投稿された URL は、直接ではなく中継ページを経由するリンクになる。「このリンク先へ行きますか?」と確認させるためのページで、広告枠を置ける。
++
++```
++スレッド HTML:  <a href="../jump.cgi?u=<URL (base64url)>&s=<署名>">元の URL の文字</a>
++  → 中継ページ: 移動先のホスト名 + URL 全体を文字で表示 + 「進む」「戻る」(自動では転送しない)
++  → 「進む」を押したときだけ、外部サイトへ
++```
++
++- **署名つき**: `s` は `HMAC-SHA256(jump_secret.txt の鍵, 'jump:' + URL)` の先頭132bit。署名が合うもの (= この掲示板に実際に投稿された URL) だけを表示する。
++  署名がなければ「どんな URL へも飛ばせる踏み台」になり、フィッシングに使われる。`u` や `s` を1文字変えても、別の URL に替えても、ランダムな署名でも通らない (テストで確認)。
++- **署名の鍵は、作り直さない**: `jump_secret.txt` を失うと、投稿済みの中継リンクが全部開けなくなる (トリップや ID の鍵より重い)。バックアップに入れること。
++  署名が合わないときは、「進む」を出さず、URL を文字だけで見せる (クリックできるリンクにはしない)。
++- **中継ページの安全対策**: `http` / `https` で、ホスト名が英数字で始まる ASCII の URL だけ (2000文字まで)。`xn--` を含むドメインには注意を出す。
++  `noindex`、`no-referrer`、`no-store`、CSP (nonce つきのスクリプトだけ、他サイトに埋め込めない)。
++- **広告枠**: `ad.html` を置くと、中継ページに「広告」ラベルつきの iframe で出る。`sandbox="allow-scripts allow-popups"` (`allow-same-origin` なし) なので、広告のコードは掲示板のデータに触れない。
++  `ad.html` が無ければ何も出ない。広告サービスの規約 (中継ページへの設置など) は、使う前に確認すること。
++- 直リンクに戻すときは、`config.php` に `define('JUMP_ENABLED', false);`。
++- 既存のスレッド (中継を入れる前の投稿) の直リンクは、書き換えていない。
++
++## 鍵つきスレッド (認証キー)
++
++スレッドを「認証キーがないと書き込めない」にできる。読むのは誰でもできる。**既定は鍵なし**で、管理者があとからでも鍵をかけられる。
++
++管理画面 (`/admin.cgi`) → 板 → スレッド一覧の「鍵の管理」:
++
++- **鍵をかける / 外す**: 鍵つきのスレッドには、返信フォームに「🔒 認証キー」の欄が出る (スレッドの末尾の返信フォームを差し替え、板の index も作り直す)。外すと元に戻る。
++- **キーを発行する**: ラベル (誰に渡すか) と範囲を選ぶ。範囲は「このスレッドだけ」か「この板の鍵つきスレッドどれでも」。
++  キーは `ABCD-EFGH-IJKL-MNOP-QRST-UVWX` の形 (120bit のランダム値) で、**発行した画面に1度だけ**出る。サーバーにはハッシュしか残らない。
++  鍵をかける前に発行しても、あとから発行してもよい。
++- **失効する**: キーごとに取り消せる。ほかのキーには影響しない。
++
++仕組み:
++
++- 鍵つきの印は `板/<スレ番号>.lock` (空のファイル)。キーの一覧は `板/keys.txt` (ID、ラベル、HMAC、範囲、発行日時、状態)。どちらも配信されない (許可リスト)。
++- キーのハッシュは `key_secret.txt` の鍵つき HMAC-SHA256 (トリップ・ID とは別の鍵)。この鍵を失うと、発行済みのキーは全部使えなくなる。
++- 投稿のとき、`amezo.php` は**スレッドのファイルロックの中で**鍵の有無を確認する。管理者が鍵をかけ外しする操作も同じロックの中で行うので、「フォームには欄が無いのに鍵つき」のようなずれは起きない (60件の同時投稿 + 鍵のかけ外し12回で確認)。
++- 照合に失敗したときの文言は2種類だけ (「キーが必要」と「キーが正しくありません」)。失効・範囲外・存在しない、は区別しない。
++  キーは推測できない長さなので、失敗回数の制限は付けていない。
++- キーは大文字小文字・ハイフン・空白の違いを問わない。鍵なしのスレッドに付いたキーは無視される。
++- スレッドが過去ログに退避されるときは、`.lock` も消す。
++- 鍵つきのスレッドの返信フォームは古いページに残っていることがある。そのときは「ページを再読み込みして」と案内する。
+ 
+ ## 鍵
+ 
+@@ -102,6 +148,10 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+   - リンクは `amezo.cgi?folder=板&page=3` (GET)。押すと、そのページのファイルが新しければそのまま、古ければ (10秒) 作り直して `index3.html` へ転送する。範囲外の番号は最後のページになる。
+   - 同じページは誰が頼んでも同じ内容なので、共有の `index2.html` のような上書きの取り違えは起きない。フォーム送信ではないので「再送信しますか」も出ない。10分たったファイルは掃除する。
+   - 「◯番目から」の細かい位置指定はできない (20件区切り)。古い index に残っている `next=N` の欄は、そのページに読み替えて受ける。
++- **投稿された URL は、署名つきの中継ページ (`/jump.cgi`) 経由のリンクになる** (下の「外部リンクの中継ページ」)。新規の投稿だけが対象で、既存のスレッドの直リンクはそのまま。
++- 本文の URL のリンク化 (`linkify_urls()`) を作り直した。URL とみなすのは、`http://` か `https://` で始まり、ホスト名が英数字で始まり、URL に使える **ASCII の文字だけ** (と、エスケープされた `&amp;` `&#39;`)。
++  直後の日本語 (`http://example.com見てね`)、`<…>` や `"…"` の閉じ側、末尾の `.` `,` `!` `?`、対応のない `)` `]`、末尾の `(` は URL に含めない。`http:evil` や `javascript:` はリンクにしない。
++  href はエスケープを戻してから属性用にエスケープし直す (`&` は `&amp;`)。デコード済みの日本語を含む URL (`/wiki/PHP_(言語)` など) は、最初の日本語で切れる (アドレスバーからコピーした `%E6…` の形ならそのまま通る)。
+ - `AMEZO-NEXT` のコメントは出さない。
+ - 投稿行に `data-id` / `data-trip` と `ID:xxxxxxxx` が入る。新しいスレッドと index には `hide.js` を読む `<script>` が入る (既存スレッドには入らない)。
+ - スレッドの末尾だけを読むので、レス数が増えても投稿・再生成のメモリは増えない。管理画面も1行ずつ読んで出す (5000レスのスレッドでも `memory_limit=3M` で動く)。
+@@ -109,8 +159,10 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ 
+ ## 検証した内容
+ 
+-- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送りの表示を合わせた 108 項目が一致。
++- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離) を合わせた 214 項目が一致。
+ - `tests/e2e.sh` + `tests/cmp.py`: 同じ投稿 25 通りを Python 版と PHP 版に流し、エラー文言と生成 HTML (スレッド・index・過去ログ) が一致 (日時・ID・番号などは正規化)。
++- `tests/jump_test.py`: 中継ページ (リンクの形、署名の検証、改ざん・ランダムな署名・壊れた入力が通らないこと、鍵を失った場合、広告枠、`res_view` の相対パス、配信) を確認。
++- `tests/lock_test.py` と `tests/lock_retire.php`: 鍵つきスレッド (鍵をかける前後の発行、書き込みの可否、範囲、失効、鍵を外す、フォームの差し替え、配信されないこと、同時のかけ外し、退避時の `.lock`) を確認。
+ - `tests/pager.sh` と `tests/unit.php`: ページ送り (実在するページだけ、範囲外は最後のページ、前へ/次への出し分け、1ページの板では出さない、11ページ以上の省略表示、ファイル数) を確認。
+ - 同時投稿 60 件 → 61 レスが欠けずに連番、返信フォームは1つ。
+ - 200 スレッドの板 + 5000 レスのスレッドで index 再生成のピークメモリ 0.71MB (`tests/mem.php`)。古いスレッド5万本の板は `tests/mem_old.php`。`memory_limit=3M` でも 5.5MB のスレッドへ投稿できる。
+@@ -120,6 +172,8 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ 
+ ## まだ無いもの / 未確認
+ 
++- 既存スレッドの直リンクを中継リンクに書き換える処理 (サーバー側の一括スクリプト。ブラウザ側では署名が作れないので不可)。広告の中身。
++- 鍵つきスレッドで、スレを立てた人が自分でキーを発行する機能 (今は管理者だけ)。書き込みにキーのラベルを表示する機能。
+ - 既存スレッドに `hide.js` を入れる処理 (新しいスレッドと index にだけ入る)。
+ - `>>数字` のアンカーと連鎖あぼーん (今は `>>` を `>` に畳む仕様)。
+ - Colab 上での実行、PHP 8.1、実際の cloudflared 経由のアクセス (テストは PHP 8.3 + `php -S` + `--no-tunnel` だけ)。nginx + PHP-FPM も未確認。
+diff --git a/admin.php b/admin.php
+index 9ace267..f92e1b2 100644
+--- a/admin.php
++++ b/admin.php
+@@ -26,6 +26,8 @@ td.body { max-width: 32em; word-break: break-all; }
+ form.inline { display: inline; }
+ .msg { padding: 6px 10px; border: 1px solid #c33; margin: 8px 0; }
+ .msg.ok { border-color: #393; }
++.keybox { border: 2px solid #c60; padding: 10px 14px; margin: 10px 0; background: #fff8e8; }
++.keybox code { font-size: 1.3em; letter-spacing: 0.05em; user-select: all; }
+ button { padding: 4px 12px; }
+ </style>
+ CSS;
+@@ -275,13 +277,15 @@ function show_threads(string $pw, string $folder, string $message = '', bool $ok
+     foreach (array_slice($active, 0, LIST_LIMIT) as [$mt, $res, $path]) {
+         [$title, $count] = thread_summary($path);
+         $rows .= '<tr><td>' . ($title !== '' ? E($title) : '(題名なし)') . "</td><td>{$count}</td><td>" . fmt_time($mt) . '</td><td>'
++            . (thread_is_locked($folder, $res) ? '🔒' : '') . '</td><td>'
+             . btn($pw, 'レスを見る', ['act' => 'replies', 'folder' => $folder, 'res' => $res]) . ' '
++            . btn($pw, '鍵の管理', ['act' => 'keys', 'folder' => $folder, 'res' => $res]) . ' '
+             . btn($pw, '非表示', ['act' => 'hide', 'folder' => $folder, 'res' => $res], 'このスレッドを非表示にします。よろしいですか?')
+             . '</td></tr>';
+     }
+     $body = msg_html($message, $ok) . nav($pw);
+     if ($rows !== '') {
+-        $body .= '<table><tr><th>題名</th><th>レス数</th><th>更新</th><th></th></tr>' . $rows . '</table>';
++        $body .= '<table><tr><th>題名</th><th>レス数</th><th>更新</th><th>鍵</th><th></th></tr>' . $rows . '</table>';
+         if (count($active) > LIST_LIMIT) {
+             $body .= '<p>新しい順に ' . LIST_LIMIT . ' 件だけ表示しています (全 ' . count($active) . ' 件)。</p>';
+         }
+@@ -335,6 +339,52 @@ function show_replies(string $pw, string $folder, string $res, string $message =
+     page_foot();
+ }
+ 
++/** 鍵の管理: 鍵のかけ外し、キーの発行・失効。発行したキーは、この画面に1度だけ出す */
++function show_keys(string $pw, string $folder, string $res, string $message = '', bool $ok = true, ?string $issued = null): never
++{
++    $path = "./$folder/$res.html";
++    if (!is_file($path)) fatal($pw, 'スレッドがありません。');
++    $fp = @fopen($path, 'r');
++    $title = $fp ? first_line_title((string)fgets($fp)) : '';
++    if ($fp) fclose($fp);
++    $locked = thread_is_locked($folder, $res);
++    $base = ['folder' => $folder, 'res' => $res];
++
++    $body = msg_html($message, $ok) . nav($pw, $folder);
++    if ($issued !== null) {
++        $body .= '<div class="keybox"><b>キーを発行しました。この画面を閉じると、二度と表示されません。</b>'
++            . '<br>いまのうちに控えて、書き込んでよい人に渡してください。<br><br><code>' . E($issued) . '</code></div>';
++    }
++    $body .= '<p>状態: <b>' . ($locked ? '🔒 鍵つき (認証キーがないと書き込めません)' : '鍵なし (誰でも書き込めます)') . '</b></p><p>'
++        . ($locked
++            ? btn($pw, '鍵を外す', ['act' => 'unlock'] + $base, 'このスレッドの鍵を外して、誰でも書き込めるようにします。よろしいですか?') . ' '
++              . btn($pw, '書き込みフォームを作り直す', ['act' => 'lock'] + $base)
++            : btn($pw, '鍵をかける', ['act' => 'lock'] + $base, 'このスレッドに鍵をかけます。キーを持たない人は書き込めなくなります。よろしいですか?'))
++        . '</p><p>※ 鍵つきでも、読むのは誰でもできます。</p>';
++
++    $rows = '';
++    foreach (keys_load($folder) as $r) {
++        if ($r['scope'] !== '*' && $r['scope'] !== $res) continue;      // このスレッドで使えるキーだけ
++        $active = $r['status'] === 'active';
++        $rows .= '<tr><td>' . E($r['id']) . '</td><td>' . E($r['label']) . '</td><td>'
++            . ($r['scope'] === '*' ? 'この板の鍵つきスレッドどれでも' : 'このスレッドだけ') . '</td><td>' . fmt_time($r['created']) . '</td><td>'
++            . ($active ? '有効' : '失効') . '</td><td>'
++            . ($active ? btn($pw, '失効', ['act' => 'revoke', 'id' => $r['id']] + $base,
++                             $r['scope'] === '*' ? 'このキーは、この板の鍵つきスレッド全部で使えなくなります。よろしいですか?' : 'このキーを失効します。よろしいですか?') : '')
++            . '</td></tr>';
++    }
++    $body .= '<h3>キー</h3>' . ($rows !== ''
++        ? '<table><tr><th>ID</th><th>ラベル</th><th>範囲</th><th>発行日時</th><th>状態</th><th></th></tr>' . $rows . '</table>'
++        : '<p>このスレッドで使えるキーはまだありません。</p>');
++    $body .= '<h3>キーを発行する</h3><form method="post" action="admin.cgi">' . hidden($pw, ['act' => 'issue'] + $base)
++        . 'ラベル (誰に渡すか。40文字まで) <input type="text" name="label" size="24"><br>'
++        . '範囲 <label><input type="radio" name="scope" value="thread" checked> このスレッドだけ</label> '
++        . '<label><input type="radio" name="scope" value="board"> この板の鍵つきスレッドどれでも</label><br>'
++        . '<button type="submit">発行</button></form>'
++        . '<p>鍵をかける前にキーを発行しても、あとから発行してもかまいません。キーは発行したときに1度だけ表示されます (サーバーにはハッシュしか残りません)。</p>';
++    page('鍵の管理: ' . ($title !== '' ? $title : '(題名なし)') . " ({$folder}/{$res})", $body);
++}
++
+ // ---- 操作 ------------------------------------------------------------------
+ 
+ /** @return array{0: bool, 1: string} */
+@@ -459,6 +509,21 @@ function admin_main(): void
+         [$ok, $message] = do_delete($folder, $res, $nums);
+         if ($ok) $message .= regen($folder);
+         show_replies($pw, $folder, $res, $message, $ok);
++    } elseif ($act === 'keys') {
++        show_keys($pw, $folder, $res);
++    } elseif ($act === 'lock' || $act === 'unlock') {
++        [$ok, $message] = thread_set_lock($folder, $res, $act === 'lock');
++        if ($ok) $message .= regen($folder);
++        show_keys($pw, $folder, $res, $message, $ok);
++    } elseif ($act === 'issue') {
++        $scope = $get('scope') === 'board' ? '*' : $res;
++        $key = key_issue($folder, $get('label'), $scope);
++        if ($key === null) show_keys($pw, $folder, $res, 'キーを保存できませんでした。', false);
++        show_keys($pw, $folder, $res, '', true, $key);
++    } elseif ($act === 'revoke') {
++        $id = $get('id');
++        $ok = preg_match('/^[A-Z2-7]{4}$/', $id) && key_revoke($folder, $id);
++        show_keys($pw, $folder, $res, $ok ? "キー {$id} を失効しました。" : 'キーを失効できませんでした。', (bool)$ok);
+     } elseif ($act === 'hide') {
+         [$ok, $message] = do_hide($folder, $res);
+         if ($ok) $message .= regen($folder);
+diff --git a/amezo.php b/amezo.php
+index 08d769f..a1326b6 100644
+--- a/amezo.php
++++ b/amezo.php
+@@ -24,29 +24,6 @@ try {
+     bbs_error('サーバーの設定に問題があります (鍵ファイルを読み書きできません).');
+ }
+ 
+-/** スレッドファイルの末尾から [返信フォームの位置, 最後のレス番号, 最後のレス行] を求める (全体は読まない) */
+-function thread_append_pos($W): array
+-{
+-    $size = (int)fstat($W)['size'];
+-    if ($size === 0) return [0, 0, ''];
+-    $n = min($size, 65536);
+-    $off = $size - $n;
+-    fseek($W, $off);
+-    $tail = (string)fread($W, $n);
+-    $p = strrpos($tail, "\n<form");
+-    if ($p === false) {                       // 返信フォームが無い (壊れている) ときは末尾に足す
+-        $footer = $size;
+-        $before = rtrim($tail, "\n");
+-    } else {
+-        $footer = $off + $p + 1;
+-        $before = substr($tail, 0, $p);
+-    }
+-    $nl = strrpos($before, "\n");
+-    $prev = $nl === false ? $before : substr($before, $nl + 1);
+-    $cnt = preg_match('/<dt>(\d+)/', $prev, $m) ? (int)$m[1] : 0;
+-    return [$footer, $cnt, $prev];
+-}
+-
+ function amezo_main(): void
+ {
+     $content_len = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+@@ -163,9 +140,7 @@ function amezo_main(): void
+         $ip = client_ip();
+         if ($subj !== '') check_global_ip($ip);
+ 
+-        $linked = preg_replace_callback('/(https?:[\w.~\-\/?+=:@%;#&]+)/u', 'url_link', $comm);
+-        if ($linked === null) bbs_error('コメントを処理できません.');      // 正規表現の失敗で本文が消えるのを防ぐ
+-        $comm = $linked;
++        $comm = linkify_urls($comm);
+ 
+         $trip = '';
+         if ($cap_ok) {
+@@ -198,9 +173,23 @@ function amezo_main(): void
+         }
+ 
+         flock($W, LOCK_EX);
+-        [$footer, $cnt, $prev] = thread_append_pos($W);
++        [$footer, $cnt, $prev] = thread_footer_info($W);
+         $cnt++;
+ 
++        // 鍵つきスレッド: 状態の確認からフォームの書き込みまで、同じロックの中でやる (管理者の鍵のかけ外しとずれない)
++        $locked = $subj === '' && thread_is_locked($folder, $res);
++        if ($locked) {
++            $given = $form['key'] ?? '';
++            if ($given === '') {
++                fclose($W);
++                bbs_error('このスレッドは認証キーが必要です。ページを再読み込みして、認証キーの欄に入力してください。');
++            }
++            if (!key_verify($folder, $res, $given)) {
++                fclose($W);
++                bbs_error('認証キーが正しくありません。');
++            }
++        }
++
+         // 二重カキコ: 直前のレスと名前・本文が同じ (1レス目は題名の後ろに名前があるので、名前の位置で拾う)
+         if (preg_match('/投稿者：<font[^>]*><b>(.+?) <\/b>.+<dd>(.+?) <\/dl>/u', $prev, $pm)
+             && $name === $pm[1] && $comm === $pm[2]) {
+@@ -221,7 +210,7 @@ function amezo_main(): void
+ 
+         $data = "{$subj1}<dl><dt>{$cnt}{$subj2}投稿者：<font color=forestgreen><b>{$name} </b></font>"
+             . "{$meta}　投稿日：{$date_str} ID:{$id}</font><br><dd>{$comm} </dl>\n"
+-            . reply_form($res) . "</body></html>\n";
++            . reply_form($res, '', $locked) . "</body></html>\n";
+ 
+         fseek($W, $footer);
+         fwrite($W, $data);
+diff --git a/jump.php b/jump.php
+new file mode 100644
+index 0000000..50ee530
+--- /dev/null
++++ b/jump.php
+@@ -0,0 +1,93 @@
++<?php
++declare(strict_types=1);
++//
++// jump.php - 外部サイトへの中継ページ (/jump.cgi も、ここに向く)
++//
++//   投稿された URL へのリンクは、このページを経由する: /jump.cgi?u=<URL (base64url)>&s=<署名>
++//   署名が合うもの (= この掲示板に実際に投稿された URL) だけを表示する。署名がなければ、
++//   このページは「どんな URL へも飛ばせる踏み台」になってしまい、フィッシングに悪用される。
++//   自動では転送しない。飛び先を文字で全部見せて、「進む」を押したときだけ外へ出る。
++//
++require __DIR__ . '/lib.php';
++
++function jump_headers(string $nonce): void
++{
++    header('Content-Type: text/html; charset=UTF-8');
++    header('Cache-Control: no-store');
++    header('X-Robots-Tag: noindex, nofollow');
++    header('Referrer-Policy: no-referrer');
++    header('X-Content-Type-Options: nosniff');
++    header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{$nonce}'; "
++         . "frame-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
++}
++
++function jump_page(string $title, string $body, string $nonce, bool $with_back = true): never
++{
++    jump_headers($nonce);
++    echo '<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">'
++        . '<meta name="viewport" content="width=device-width, initial-scale=1">'
++        . '<meta name="robots" content="noindex, nofollow"><meta name="referrer" content="no-referrer">'
++        . '<title>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</title>'
++        . '<style>:root{color-scheme:light dark}body{font-family:sans-serif;max-width:40em;margin:1.5em auto;padding:0 1em;line-height:1.6}'
++        . '.url{word-break:break-all;border:1px solid #888;padding:.6em .8em;margin:.8em 0;font-family:monospace}'
++        . '.host{font-size:1.4em;font-weight:bold;word-break:break-all}'
++        . '.btns{margin:1.2em 0}.go,.back{display:inline-block;padding:.5em 1.6em;margin-right:.8em;border:1px solid #888;border-radius:6px;'
++        . 'font-size:1em;text-decoration:none;cursor:pointer;background:transparent;color:inherit}.go{font-weight:bold}'
++        . '.note{font-size:.9em;opacity:.85}.warn{border:1px solid #c60;padding:.4em .7em;margin:.6em 0}'
++        . '.ad{margin:1.5em 0}.ad small{display:block;opacity:.7}.ad iframe{width:100%;height:260px;border:1px solid #888}</style>'
++        . '</head><body><h2>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</h2>' . $body;
++    if ($with_back) {
++        echo '<script nonce="' . $nonce . '">document.getElementById("back").addEventListener("click",function(){'
++           . 'if(history.length>1){history.back();}else{window.close();}});</script>';
++    }
++    echo '</body></html>';
++    exit;
++}
++
++function jump_main(): void
++{
++    $nonce = bin2hex(random_bytes(12));
++    $u = is_string($_GET['u'] ?? null) ? $_GET['u'] : '';
++    $s = is_string($_GET['s'] ?? null) ? $_GET['s'] : '';
++    $url = strlen($u) <= 3000 ? b64url_decode($u) : null;
++
++    if ($url === null || !jump_verify($url, $s)) {
++        // 署名が合わない: リンクにはしない。URL として読めるなら、文字だけ見せる (自分で確かめてから開けるように)
++        $body = '<p>このリンクは、署名が合わないため、自動では開きません。<br>'
++              . '掲示板に投稿された URL ではないか、投稿のあとに署名の鍵が変わった可能性があります。</p>';
++        if ($url !== null && url_is_valid($url)) {
++            $body .= '<p class="note">URL (リンクにはしていません。確かめてから、自分で開いてください):</p>'
++                   . '<div class="url">' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '</div>';
++        }
++        $body .= '<div class="btns"><button type="button" class="back" id="back">戻る</button></div>';
++        jump_page('このリンクは使えません', $body, $nonce);
++    }
++
++    $host = parse_url($url, PHP_URL_HOST);
++    if (!is_string($host) || $host === '') $host = '(ホスト名を読み取れません)';
++    $e = static fn(string $x): string => htmlspecialchars($x, ENT_QUOTES, 'UTF-8');
++
++    $body = '<p>この掲示板に投稿された、外部サイトへのリンクです。移動先を確かめてから、「進む」を押してください。</p>'
++          . '<p class="note">移動先のサイト</p><div class="host">' . $e($host) . '</div>'
++          . '<p class="note">URL 全体</p><div class="url">' . $e($url) . '</div>';
++    if (stripos($host, 'xn--') !== false) {
++        $body .= '<div class="warn">ドメイン名に <code>xn--</code> が含まれています。見た目が似た別のサイトのことがあるので、特に注意してください。</div>';
++    }
++    $body .= '<div class="btns"><a class="go" href="' . $e($url) . '" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">進む</a>'
++           . '<button type="button" class="back" id="back">戻る</button></div>'
++           . '<p class="note">このページは自動では転送しません。リンク先の内容について、掲示板は責任を負いません。</p>';
++    // 広告枠: ad.html があるときだけ。別オリジン扱い (allow-same-origin なし) の iframe に入れて、掲示板のデータに触れさせない
++    if (is_file(__DIR__ . '/ad.html')) {
++        $body .= '<div class="ad"><small>広告</small>'
++               . '<iframe src="ad.html" sandbox="allow-scripts allow-popups" referrerpolicy="no-referrer" loading="lazy" title="広告"></iframe></div>';
++    }
++    jump_page('外部サイトへ移動します', $body, $nonce);
++}
++
++try {
++    jump_main();
++} catch (RuntimeException $e) {
++    error_log('jump: ' . $e->getMessage());
++    http_response_code(500);
++    echo 'サーバーの設定に問題があります。';
++}
+diff --git a/lib.php b/lib.php
+index b030343..372cc52 100644
+--- a/lib.php
++++ b/lib.php
+@@ -37,6 +37,7 @@ foreach ([
+     'COMM_LINES_MAX'  => 20,
+     'HASH_ITERATIONS' => 100000,
+     'TRUSTED_PROXIES' => ['127.0.0.1', '::1'],
++    'JUMP_ENABLED'    => true,     // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする (false なら直リンク)
+ ] as $k => $v) {
+     defined($k) || define($k, $v);
+ }
+@@ -61,6 +62,18 @@ const KAKO_LIST        = 'kako.txt';
+ const KAKO_SEP         = '<>';
+ const HASH_SCHEME      = 'pbkdf2_sha256';
+ 
++// ---- 認証キー (鍵つきスレッド) ----
++const KEY_SECRET_FILE = 'key_secret.txt';   // キーのハッシュ用の秘密鍵 (トリップ/ID とは別)
++const KEY_CTX         = 'key:';             // 公開後に変えない
++const KEYS_FILE       = 'keys.txt';         // 板ごと: <板>/keys.txt
++const KEY_ALPHABET    = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
++
++// ---- 中継ページ (jump.php): 投稿の URL への署名つきリンク ----
++const JUMP_SECRET_FILE = 'jump_secret.txt'; // 署名用の秘密鍵 (他の鍵とは別)。失うと、投稿済みの中継リンクが全部使えなくなる
++const JUMP_CTX         = 'jump:';           // 公開後に変えない
++const JUMP_SIG_LEN     = 22;                // 署名の長さ (base64url で22文字 = 132bit)
++const URL_MAX_LEN      = 2000;
++
+ const SCRIPT_TAG = '<script src="../hide.js" defer></script>';
+ const COPYRIGHT  = "<!--\n    Script for amezo-like BBS (PHP Version)\n    Original Copyright (C) 1999-2003 amezo_\n    http://www17.big.or.jp/~amezo_/\n    http://ame.x0.com/\n-->\n";
+ const ENTITY_TOKEN_RE = '/&(?:amp|quot|lt|gt|#39);|./su';
+@@ -345,26 +358,293 @@ function redirect(string $folder, string $index_name): never
+     exit;
+ }
+ 
+-function url_link(array $m): string
++function b64url_encode(string $bin): string
++{
++    return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
++}
++
++function b64url_decode(string $s): ?string
++{
++    if ($s === '' || !preg_match('/^[A-Za-z0-9_-]+$/D', $s)) return null;
++    $d = base64_decode(strtr($s, '-_', '+/'), true);
++    return $d === false ? null : $d;
++}
++
++/** 中継ページに渡してよい URL か (http/https、ホスト名は英数字か [ で始まる、使える文字は ASCII の URL 文字だけ) */
++function url_is_valid(string $url): bool
++{
++    if ($url === '' || strlen($url) > URL_MAX_LEN) return false;
++    return (bool)preg_match('/^https?:\/\/[A-Za-z0-9\[][A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()\'&]*$/D', $url);
++}
++
++/** URL の署名: HMAC-SHA256(中継用の秘密鍵, 'jump:' + URL) の先頭132bit */
++function jump_sign(string $url): string
++{
++    return substr(b64url_encode(hash_hmac('sha256', JUMP_CTX . $url, load_secret(JUMP_SECRET_FILE), true)), 0, JUMP_SIG_LEN);
++}
++
++function jump_verify(string $url, string $sig): bool
++{
++    return url_is_valid($url) && hash_equals(jump_sign($url), $sig);
++}
++
++/** スレッド HTML に書く中継リンクの href (属性用にエスケープ済み。板のフォルダの中から見た相対パス) */
++function jump_href(string $url): string
++{
++    return '../jump.cgi?u=' . b64url_encode($url) . '&amp;s=' . jump_sign($url);
++}
++
++/**
++ * エスケープ済みの本文から URL を探して、リンクにする。
++ *  - URL に使える ASCII の文字と、エスケープされた &amp; &#39; だけを URL とみなす
++ *    (直後の日本語、&gt; &quot; などのエスケープ、<br> は URL に含めない)
++ *  - 末尾の . , ; : ! ? ( と、対応のない ) ] は URL に含めない
++ *  - http:// か https:// で始まり、ホスト名の最初が英数字 (または [ ) のものだけ
++ * $jump (既定は JUMP_ENABLED) が true なら、リンク先は署名つきの中継ページ。表示する文字は元の URL のまま。
++ * false なら直リンク。href はエスケープを戻してから属性用に正しくエスケープし直す (生の & を入れない)。
++ */
++function linkify_urls(string $escaped, ?bool $jump = null): string
+ {
+-    $dsp = $m[1];
+-    $url = str_replace('&amp;', '&', $dsp);
+-    return '<a href="' . $url . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>';
++    $jump ??= JUMP_ENABLED;
++    return (string)preg_replace_callback(
++        '/https?:\/\/(?:[A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()]|&amp;|&#39;)+/',
++        static function (array $m) use ($jump): string {
++            $dsp = $m[0];
++            $tail = '';
++            while ($dsp !== '') {
++                if (str_ends_with($dsp, '&amp;') || str_ends_with($dsp, '&#39;')) {
++                    $cut = 5;
++                } else {
++                    $c = $dsp[strlen($dsp) - 1];
++                    if (str_contains('.,;:!?(', $c)) $cut = 1;
++                    elseif ($c === ')' && substr_count($dsp, ')') > substr_count($dsp, '(')) $cut = 1;
++                    elseif ($c === ']' && substr_count($dsp, ']') > substr_count($dsp, '[')) $cut = 1;
++                    else break;
++                }
++                $tail = substr($dsp, -$cut) . $tail;
++                $dsp = substr($dsp, 0, -$cut);
++            }
++            $url = str_replace(['&amp;', '&#39;'], ['&', "'"], $dsp);
++            if (!url_is_valid($url)) return $m[0];
++            $href = $jump ? jump_href($url) : html_escape($url);
++            return '<a href="' . $href . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>' . $tail;
++        },
++        $escaped
++    );
+ }
+ 
+-/** レス用フォーム (1行で返す。スレッドファイルのパーサが行単位のため) */
+-function reply_form(string $res, string $links = ''): string
++/** レス用フォーム (1行で返す。スレッドファイルのパーサが行単位のため)。鍵つきスレッドは認証キーの欄が付く */
++function reply_form(string $res, string $links = '', bool $locked = false): string
+ {
+     return '<form method=post action="../amezo.cgi" class="post">'
+         . '<input type=hidden name="res" value="' . $res . '">'
+         . '<div class="row">投稿者 <input type=text name="name" size=20> '
+         . 'メール <input type=text name="mail" size=20 maxlength=50></div>'
++        . ($locked ? '<div class="row">🔒 認証キー <input type=password name="key" size=32 autocomplete=off required>'
++                     . ' このスレッドは認証キーがないと書き込めません</div>' : '')
+         . '<textarea name="comm" rows=4 cols=70 maxlength=400></textarea>'
+         . '<div class="row"><input type=submit value="↑へのレスカキコ"></div>'
+         . $links
+         . '</form>';
+ }
+ 
++// =========================================================================
++// 認証キー (鍵つきスレッド): <板>/<スレ番号>.lock があれば、書き込みにキーが要る
++// =========================================================================
++
++function thread_is_locked(string $folder, string $res): bool
++{
++    return is_file("./$folder/$res.lock");
++}
++
++/** スレッドファイルの末尾から [返信フォームの位置, 最後のレス番号, 最後のレス行] を求める (全体は読まない) */
++function thread_footer_info($W): array
++{
++    $size = (int)fstat($W)['size'];
++    if ($size === 0) return [0, 0, ''];
++    $n = min($size, 65536);
++    $off = $size - $n;
++    fseek($W, $off);
++    $tail = (string)fread($W, $n);
++    $p = strrpos($tail, "\n<form");
++    if ($p === false) {                       // 返信フォームが無い (壊れている) ときは末尾に足す
++        $footer = $size;
++        $before = rtrim($tail, "\n");
++    } else {
++        $footer = $off + $p + 1;
++        $before = substr($tail, 0, $p);
++    }
++    $nl = strrpos($before, "\n");
++    $prev = $nl === false ? $before : substr($before, $nl + 1);
++    $cnt = preg_match('/<dt>(\d+)/', $prev, $m) ? (int)$m[1] : 0;
++    return [$footer, $cnt, $prev];
++}
++
++function base32_encode_bytes(string $bin): string
++{
++    $out = '';
++    $bits = 0;
++    $buf = 0;
++    foreach (str_split($bin) as $ch) {
++        $buf = ($buf << 8) | ord($ch);
++        $bits += 8;
++        while ($bits >= 5) {
++            $bits -= 5;
++            $out .= KEY_ALPHABET[($buf >> $bits) & 31];
++        }
++        $buf &= (1 << $bits) - 1;
++    }
++    if ($bits > 0) $out .= KEY_ALPHABET[($buf << (5 - $bits)) & 31];
++    return $out;
++}
++
++/** 入力されたキーを正規の形 (大文字24文字) にそろえる。形が違えば null */
++function key_normalize(string $s): ?string
++{
++    $c = strtoupper((string)preg_replace('/[^A-Za-z2-7]/', '', $s));
++    return strlen($c) === 24 ? $c : null;
++}
++
++function key_display(string $canon): string
++{
++    return implode('-', str_split($canon, 4));
++}
++
++function key_hash(string $canon): string
++{
++    return hash_hmac('sha256', KEY_CTX . $canon, load_secret(KEY_SECRET_FILE));
++}
++
++/** keys.txt の全行 (管理画面用。キーは板ごとに数が少ない前提) */
++function keys_load(string $folder): array
++{
++    $rows = [];
++    $fp = @fopen("./$folder/" . KEYS_FILE, 'r');
++    if (!$fp) return $rows;
++    while (($line = fgets($fp)) !== false) {
++        $p = explode("\t", rtrim($line, "\r\n"));
++        if (count($p) !== 6) continue;
++        $rows[] = ['id' => $p[0], 'label' => $p[1], 'hash' => $p[2], 'scope' => $p[3], 'created' => (int)$p[4], 'status' => $p[5]];
++    }
++    fclose($fp);
++    return $rows;
++}
++
++/** 投稿のときの照合用: ID の行だけを、1行ずつ読んで探す */
++function key_find_row(string $folder, string $id): ?array
++{
++    $fp = @fopen("./$folder/" . KEYS_FILE, 'r');
++    if (!$fp) return null;
++    $found = null;
++    while (($line = fgets($fp)) !== false) {
++        if (!str_starts_with($line, $id . "\t")) continue;
++        $p = explode("\t", rtrim($line, "\r\n"));
++        if (count($p) === 6) {
++            $found = ['id' => $p[0], 'label' => $p[1], 'hash' => $p[2], 'scope' => $p[3], 'created' => (int)$p[4], 'status' => $p[5]];
++            break;
++        }
++    }
++    fclose($fp);
++    return $found;
++}
++
++/** キーがこのスレッドに書き込めるか。失効・範囲外・存在しない・形が違う、はどれも false (区別しない) */
++function key_verify(string $folder, string $res, string $input): bool
++{
++    $canon = key_normalize($input);
++    if ($canon === null) return false;
++    $row = key_find_row($folder, substr($canon, 0, 4));
++    if ($row === null || $row['status'] !== 'active') return false;
++    if (!hash_equals($row['hash'], key_hash($canon))) return false;
++    return $row['scope'] === '*' || $row['scope'] === $res;
++}
++
++/** keys.txt を排他ロックして、$fn(全行) の結果で書き直す (一時ファイル + rename)。失敗したら false */
++function keys_update(string $folder, callable $fn): bool
++{
++    $lk = @fopen("./$folder/keys.lock", 'c');
++    if (!$lk) return false;
++    flock($lk, LOCK_EX);
++    $rows = $fn(keys_load($folder));
++    $path = "./$folder/" . KEYS_FILE;
++    $tmp = $path . '.tmp' . getmypid();
++    $old = umask(0077);
++    $W = @fopen($tmp, 'w');
++    umask($old);
++    $ok = false;
++    if ($W) {
++        foreach ($rows as $r) {
++            fwrite($W, implode("\t", [$r['id'], $r['label'], $r['hash'], $r['scope'], $r['created'], $r['status']]) . "\n");
++        }
++        fclose($W);
++        $ok = @rename($tmp, $path);
++        if (!$ok) @unlink($tmp);
++    }
++    flock($lk, LOCK_UN);
++    fclose($lk);
++    return $ok;
++}
++
++/** 管理者がキーを発行する。戻り値: 表示用のキー (この1回しか見られない)。保存できなければ null */
++function key_issue(string $folder, string $label, string $scope): ?string
++{
++    $label = trim((string)preg_replace('/[\x00-\x1f\x7f]/u', ' ', $label));
++    $label = mb_substr($label, 0, 40, 'UTF-8');
++    if ($label === '') $label = '(無題)';
++    if ($scope !== '*' && !preg_match('/^\d{1,20}$/', $scope)) return null;
++
++    $display = null;
++    $ok = keys_update($folder, static function (array $rows) use ($label, $scope, &$display): array {
++        $used = array_column($rows, 'id');
++        do {
++            $canon = base32_encode_bytes(random_bytes(15));      // 120bit = 24文字。先頭4文字が ID
++            $id = substr($canon, 0, 4);
++        } while (in_array($id, $used, true));
++        $rows[] = ['id' => $id, 'label' => $label, 'hash' => key_hash($canon), 'scope' => $scope,
++                   'created' => time(), 'status' => 'active'];
++        $display = key_display($canon);
++        return $rows;
++    });
++    return $ok ? $display : null;
++}
++
++function key_revoke(string $folder, string $id): bool
++{
++    $hit = false;
++    $ok = keys_update($folder, static function (array $rows) use ($id, &$hit): array {
++        foreach ($rows as &$r) {
++            if ($r['id'] === $id && $r['status'] === 'active') { $r['status'] = 'revoked'; $hit = true; }
++        }
++        return $rows;
++    });
++    return $ok && $hit;
++}
++
++/**
++ * スレッドに鍵をかける/外す。返信フォームの行を差し替え、印 (.lock) を作る/消す。
++ * 投稿側も同じスレッドのロックの中で .lock を確認するので、フォームと実際の状態がずれない。
++ * @return array{0: bool, 1: string}
++ */
++function thread_set_lock(string $folder, string $res, bool $lock): array
++{
++    $path = "./$folder/$res.html";
++    if (!is_file($path)) return [false, 'スレッドがありません。'];
++    $W = @fopen($path, 'r+');
++    if (!$W) return [false, 'スレッドを開けません。'];
++    flock($W, LOCK_EX);
++    [$footer] = thread_footer_info($W);
++    $new = reply_form($res, '', $lock) . "</body></html>\n";
++    fseek($W, $footer);
++    fwrite($W, $new);
++    fflush($W);
++    ftruncate($W, $footer + strlen($new));
++    $lockfile = "./$folder/$res.lock";
++    $ok = $lock ? (@file_put_contents($lockfile, '') !== false) : (!file_exists($lockfile) || @unlink($lockfile));
++    fclose($W);
++    if (!$ok) return [false, '鍵の印のファイルを更新できませんでした。'];
++    return [true, $lock ? "スレッド {$res} に鍵をかけました。" : "スレッド {$res} の鍵を外しました。"];
++}
++
+ // =========================================================================
+ // 表示処理
+ // =========================================================================
+@@ -383,18 +663,19 @@ function res_view(string $folder, array $form): never
+ 
+     header('Content-Type: text/html; charset=UTF-8');
+     while (($line = fgets($fp)) !== false) {
+-        echo str_replace(['href="../style.css"', 'src="../hide.js"'], ['href="style.css"', 'src="hide.js"'], $line);
++        echo str_replace(['href="../style.css"', 'src="../hide.js"', 'href="../jump.cgi?'], ['href="style.css"', 'src="hide.js"', 'href="jump.cgi?'], $line);
+         if (str_contains($line, '<dl>') || str_contains($line, '<dt>')) break;
+     }
+     $fol_tag = '<input type="hidden" name="folder" value="' . htmlspecialchars($folder, ENT_QUOTES, 'UTF-8') . '">';
+     // 返信フォームの行は、action を板のない位置に直し、folder を足して出す
+     $form_line = static fn(string $l): string => str_replace('</form>', $fol_tag . '</form>', str_replace('action="../', 'action="', $l));
++    $fixj = static fn(string $l): string => str_contains($l, '../jump.cgi?') ? str_replace('href="../jump.cgi?', 'href="jump.cgi?', $l) : $l;   // / 直下から出力するので、中継リンクの相対パスを直す
+     $matched = false;
+     $footer = null;
+     while (($line = fgets($fp)) !== false) {
+         if (str_starts_with($line, '<form')) $footer = $line;
+         if (preg_match('/<dt>(\d+)/', $line, $m) && (int)$m[1] >= $from) {
+-            echo $line;
++            echo $fixj($line);
+             $matched = true;
+             break;
+         }
+@@ -403,7 +684,7 @@ function res_view(string $folder, array $form): never
+         echo $form_line($footer);
+     }
+     while (($line = fgets($fp)) !== false) {
+-        echo str_contains($line, '</form>') ? $form_line($line) : $line;
++        echo str_contains($line, '</form>') ? $form_line($line) : $fixj($line);
+     }
+     fclose($fp);
+     exit;
+@@ -688,6 +969,7 @@ function regen_index(string $folder, int $page = 1, bool $reload = false, bool $
+             foreach (array_slice($files, MAX_THREADS) as [$ts, $f]) {
+                 if (!file_exists("./$folder/o$f") && @rename("./$folder/$f", "./$folder/o$f")) {
+                     $retired_now[] = [$ts, "o$f"];
++                    @unlink('./' . $folder . '/' . substr($f, 0, -5) . '.lock');     // 過去ログは書き込めないので、鍵の印は要らない
+                 }
+             }
+         }
+@@ -762,7 +1044,7 @@ function regen_index(string $folder, int $page = 1, bool $reload = false, bool $
+         }
+         $links = "<div class=\"row links\"><a href=\"{$res_id}.html\">レス全部を見る</a> "
+             . "{$sub_tag}<a href=\"#top\">上へ</a> <a href=\"./\">リロード</a></div>";
+-        fwrite($W, '</font></td></tr></table>' . "\n" . reply_form($res_id, $links) . "<hr>\n");
++        fwrite($W, '</font></td></tr></table>' . "\n" . reply_form($res_id, $links, thread_is_locked($folder, $res_id)) . "<hr>\n");
+     }
+ 
+     fwrite($W, $pager . "<hr></body></html>\n");
+diff --git a/router.php b/router.php
+index baf887a..2a9d99b 100644
+--- a/router.php
++++ b/router.php
+@@ -12,7 +12,7 @@ if (str_contains($path, "\0") || str_contains($path, '..') || str_contains($path
+ }
+ 
+ // ---- CGI 相当 (amezo.cgi / amezo.php など) ----------------------------------
+-if (preg_match('~^/(amezo|dai|admin)\.(?:cgi|php)$~', $path, $m)) {
++if (preg_match('~^/(amezo|dai|admin|jump)\.(?:cgi|php)$~', $path, $m)) {
+     $f = __DIR__ . "/{$m[1]}.php";
+     if (is_file($f)) {
+         require $f;
+@@ -24,7 +24,7 @@ if (preg_match('~^/(amezo|dai|admin)\.(?:cgi|php)$~', $path, $m)) {
+ }
+ 
+ // ---- 静的ファイル (許可リスト) -------------------------------------------------
+-if (in_array($path, ['/', '/index.html', '/style.css', '/hide.js'], true)) {
++if (in_array($path, ['/', '/index.html', '/style.css', '/hide.js', '/ad.html'], true)) {
+     return false;
+ }
+ 
+diff --git a/setup_expose.py b/setup_expose.py
+index 0a754ac..876f3c5 100644
+--- a/setup_expose.py
++++ b/setup_expose.py
+@@ -177,7 +177,7 @@ def check_flock():
+ 
+ def setup_bbs_directories():
+     print("📂 BBS用のディレクトリを確認しています...")
+-    for needed in ["router.php", "lib.php", "amezo.php", "dai.php", "admin.php", "hide.js",
++    for needed in ["router.php", "lib.php", "amezo.php", "dai.php", "admin.php", "jump.php", "hide.js",
+                    "index.html", "style.css", "header.html", "blist.txt"]:
+         if not os.path.exists(needed):
+             print(f"  ⚠️ {needed} が見つかりません")
+@@ -267,9 +267,10 @@ def self_check(port):
+     """起動直後の確認: 板一覧は出る / 鍵やパスワードや PHP のソースは配られない"""
+     print("🔎 起動チェック:")
+     good = True
+-    for path, want in [("/dai.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
++    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
+                        ("/trip_secret.txt", 404), ("/id_secret.txt", 404), ("/delpass.txt", 404),
+-                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404)]:
++                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404),
++                       ("/key_secret.txt", 404), ("/jump_secret.txt", 404)]:
+         got = http_status(port, path)
+         mark = "✅" if got == want else "❌"
+         if got != want:
+diff --git a/tests/cmp.py b/tests/cmp.py
+index 3990384..f6d4a2a 100644
+--- a/tests/cmp.py
++++ b/tests/cmp.py
+@@ -1,4 +1,4 @@
+-import re, sys, glob, os, difflib
++import re, sys, glob, os, difflib, base64, html, urllib.parse
+ def norm(t):
+     t = re.sub(r'20\d\d年\d\d月\d\d日\([日月火水木金土]\)\d\d時\d\d分\d\d秒', 'DATE', t)
+     t = re.sub(r'<font size=-1 class="meta" data-id="[^"]*"(?: data-trip="[^"]*")?>', '<font size=-1>', t)
+@@ -6,6 +6,12 @@ def norm(t):
+     t = t.replace('<script src="../hide.js" defer></script>', '')
+     t = re.sub(r'\d{12}', 'TID', t)
+     t = re.sub(r'\((?:Python|PHP) Version\)', '(X Version)', t)
++    def _jump(m):   # PHP 版の中継リンクは、u を戻した元の URL に直してから比べる
++        q = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(m.group(1))).query)
++        u = q['u'][0]
++        return 'href="' + base64.urlsafe_b64decode(u + '=' * (-len(u) % 4)).decode() + '"'
++    t = re.sub(r'href="(\.\./jump\.cgi\?[^"]*)"', _jump, t)
++    t = re.sub(r'href="([^"]*)"', lambda m: 'href="' + m.group(1).replace('&amp;', '&') + '"', t)   # URL の & の書き方の違い (PHP版は属性として正しくエスケープする)
+     t = re.sub(r'<!-- AMEZO-NEXT \d+ -->\n', '', t)      # PHP 版では出さない (ページごとに別ファイルにしたため)
+     # Python 版の「次のページ」入力欄は、PHP 版ではページ送り (pager) に置き換えた
+     t = re.sub(r'<form method=post action="../amezo.cgi">\n<input type=submit value="次のページ">\n<input type=text name="next" value="\d+" size="3">〜</form>\n', '', t)
+diff --git a/tests/jump_test.py b/tests/jump_test.py
+new file mode 100644
+index 0000000..b22de7e
+--- /dev/null
++++ b/tests/jump_test.py
+@@ -0,0 +1,108 @@
++# 中継ページ (jump.php) の結合テスト (PHP 版だけ)。前提は lock_test.py と同じ
++import base64, os, random, re, shutil, sys, time, html, urllib.request, urllib.parse, urllib.error
++PH, URL = '/tmp/phpt', 'http://127.0.0.1:8123'
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *a, **k): return None
++OP = urllib.request.build_opener(NoRedirect)
++def get(path, body=None, ip='9.9.9.9'):
++    r = urllib.request.Request(URL + path, data=body.encode() if body is not None else None, headers={'CF-Connecting-IP': ip})
++    try:
++        with OP.open(r) as f: return f.status, f.headers, f.read().decode('utf-8', 'replace')
++    except urllib.error.HTTPError as e: return e.code, e.headers, e.read().decode('utf-8', 'replace')
++def q(**kw): return urllib.parse.urlencode(kw)
++ctr = [0]
++def ip(): ctr[0] += 1; return f'11.{ctr[0] // 250}.{ctr[0] % 250}.9'
++def post(res, name, comm, subj=None):
++    d = dict(folder='adm', name=name, comm=comm)
++    if res: d['res'] = res
++    if subj: d['subj'] = subj
++    c, h, t = get('/amezo.cgi', q(**d), ip())
++    m = re.search(r'<h2>(.*?)</h2>', t); return c, (m.group(1) if m else '')
++def b64u(s): return base64.urlsafe_b64encode(s.encode()).decode().rstrip('=')
++def jump(u, s): return get('/jump.cgi?' + q(u=u, s=s))
++
++for f in os.listdir(f'{PH}/adm'): os.unlink(f'{PH}/adm/{f}')
++if os.path.exists(f'{PH}/global.mem'): os.unlink(f'{PH}/global.mem')
++if os.path.exists(f'{PH}/ad.html'): os.unlink(f'{PH}/ad.html')
++
++U1 = 'https://example.com/a?x=1&y=2'
++post(None, 'owner', f'見て {U1} だよ。https://xn--n3h.example/ もある', subj='jump test'); time.sleep(1.1)
++T = sorted(f[:-5] for f in os.listdir(f'{PH}/adm') if re.fullmatch(r'\d{12}\.html', f))[-1]
++f = open(f'{PH}/adm/{T}.html', encoding='utf-8').read()
++links = re.findall(r'<a href="(\.\./jump\.cgi\?u=([A-Za-z0-9_-]+)&amp;s=([A-Za-z0-9_-]{22}))" target="_blank" rel="noopener noreferrer nofollow">([^<]*)</a>', f)
++ok('スレッドの URL が中継リンクになった (2件)', len(links) == 2, str(len(links)))
++ok('リンクの表示文字は元の URL (&amp; はエスケープ)', links[0][3] == 'https://example.com/a?x=1&amp;y=2', links[0][3])
++ok('href に直接の飛び先 URL が入っていない', 'href="https://' not in f and 'example.com' not in links[0][0])
++ok('URL の直後の日本語は含まない', links[0][3].endswith('y=2') and '</a> だよ。' in f)
++u1, s1 = links[0][1], links[0][2]
++
++# --- 中継ページ ---
++c, h, t = jump(u1, s1)
++ok('署名が合えば中継ページが出る (200)', c == 200 and '外部サイトへ移動します' in t)
++ok('移動先のホスト名を強調表示', '<div class="host">example.com</div>' in t)
++ok('URL 全体を文字で表示', f'<div class="url">{html.escape(U1, quote=True)}</div>' in t)
++ok('「進む」は元の URL へのリンク (rel/referrer 付き)', f'<a class="go" href="{html.escape(U1, quote=True)}" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">進む</a>' in t)
++ok('自動転送しない (Location も meta refresh も無い)', 'Location' not in h and 'http-equiv="refresh"' not in t.lower())
++ok('noindex / no-referrer / no-store', 'noindex' in h.get('X-Robots-Tag', '') and h.get('Referrer-Policy') == 'no-referrer' and 'no-store' in h.get('Cache-Control', ''))
++nonce = re.search(r"script-src 'nonce-([0-9a-f]+)'", h.get('Content-Security-Policy', ''))
++ok('CSP: nonce つきスクリプトだけ許可、他のサイトに埋め込めない', bool(nonce) and f'nonce="{nonce.group(1)}"' in t and "frame-ancestors 'none'" in h['Content-Security-Policy'] and "default-src 'none'" in h['Content-Security-Policy'])
++ok('xn-- のホストには注意を出す', 'xn--' in jump(links[1][1], links[1][2])[2] and 'warn' in jump(links[1][1], links[1][2])[2])
++ok('広告枠は ad.html が無ければ出ない', '<iframe' not in t)
++
++# --- 改ざん・不正な入力は、どれも「進む」を出さない ---
++def refused(label, c_t):
++    c, h, t = c_t
++    ok(label, 'class="go"' not in t and 'このリンクは使えません' in t, f'http {c}')
++s_bad = s1[:-1] + ('A' if s1[-1] != 'A' else 'B')
++refused('署名を1文字変える', jump(u1, s_bad))
++refused('URL を別のものに変えて、元の署名を使う', jump(b64u('https://evil.example/'), s1))
++refused('署名なし', get('/jump.cgi?' + q(u=u1)))
++refused('パラメータなし', get('/jump.cgi'))
++refused('署名が短い', jump(u1, s1[:10]))
++refused('u が壊れた base64', jump('!!!!', s1))
++refused('u が長すぎる', jump('A' * 3500, s1))
++refused('配列で渡す (u[]=)', get('/jump.cgi?u[]=' + u1 + '&s[]=' + s1))
++refused('javascript: (署名なし)', jump(b64u('javascript:alert(1)'), 'A' * 22))
++t = jump(b64u('https://a.com/"><script>alert(1)</script>'), 'A' * 22)[2]
++ok('壊れた URL は画面に出さない (XSS にならない)', '<script>alert(1)' not in t and 'このリンクは使えません' in t)
++random.seed(1); fz = 0
++for i in range(150):
++    uu = b64u(random.choice(['https://a.com/', 'http://b.example/x?y=1', 'https://c.example/' + str(i)]))
++    ss = ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-') for _ in range(22))
++    if 'class="go"' in jump(uu, ss)[2]: fz += 1
++ok('ランダムな署名150件は、どれも通らない (踏み台にならない)', fz == 0, f'{fz}件が通った')
++
++# --- 署名の鍵を失った場合: 古いリンクは開かず、URL を文字で見せるだけ ---
++sec = f'{PH}/jump_secret.txt'; shutil.copy(sec, sec + '.bak'); os.unlink(sec)
++c, h, t = jump(u1, s1)
++ok('鍵を作り直されると古いリンクは「進む」を出さない', 'class="go"' not in t and '署名が合わない' in t)
++ok('その場合も URL は文字で見せる (クリックできるリンクにはしない)', html.escape(U1, quote=True) in t and f'href="{html.escape(U1, quote=True)}"' not in t)
++os.unlink(sec); shutil.move(sec + '.bak', sec)
++ok('鍵を戻せば、また開ける', 'class="go"' in jump(u1, s1)[2])
++
++# --- 広告枠 (ad.html があるときだけ。同じオリジンとして扱わない iframe) ---
++open(f'{PH}/ad.html', 'w', encoding='utf-8').write('<html><body>ad placeholder</body></html>')
++t = jump(u1, s1)[2]
++m = re.search(r'<iframe [^>]*>', t)
++ok('ad.html があれば iframe が出る (sandbox、allow-same-origin なし、広告ラベル)', bool(m) and 'sandbox="allow-scripts allow-popups"' in m.group(0) and 'allow-same-origin' not in m.group(0) and '<small>広告</small>' in t)
++ok('ad.html は配信される', get('/ad.html')[0] == 200)
++os.unlink(f'{PH}/ad.html')
++ok('ad.html を消せば、iframe は出ない・404', '<iframe' not in jump(u1, s1)[2] and get('/ad.html')[0] == 404)
++
++# --- 周辺: res_view / index / 配信 / 二重投稿 ---
++c, h, t = get('/amezo.cgi', q(folder='adm', res=T, sub='x', **{'from': 1}))
++ok('レス表示 (res_view) では、中継リンクの相対パスが jump.cgi になる', 'href="jump.cgi?u=' in t and '../jump.cgi' not in t)
++r = re.search(r'href="(jump\.cgi\?[^"]+)"', t).group(1)
++ok('レス表示のリンクから、中継ページが開く', 'class="go"' in get('/' + html.unescape(r))[2])
++idx = open(f'{PH}/adm/index.html', encoding='utf-8').read()
++ok('板の index でも中継リンク (../jump.cgi)', '../jump.cgi?u=' in idx)
++for path, want in [('/jump_secret.txt', 404), ('/jump.php', 200), ('/jump.cgi', 200)]:
++    ok(f'{path} -> {want}', get(path)[0] == want)
++c1 = post(T, 'dup', f'同じ {U1}'); c2 = post(T, 'dup', f'同じ {U1}')
++ok('同じ URL を含む本文の二重投稿を、これまでどおり検知する', c1 == (303, '') and c2 == (200, '二重カキコです.'), str(c2))
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
+diff --git a/tests/lock_retire.php b/tests/lock_retire.php
+new file mode 100644
+index 0000000..dc29068
+--- /dev/null
++++ b/tests/lock_retire.php
+@@ -0,0 +1,19 @@
++<?php
++// 過去ログに退避されるスレッドの .lock が消えることの確認 (MAX_THREADS=2)
++define('POST_INTERVAL', 0); define('GLOBAL_WINDOW', 0); define('MAX_THREADS', 2);
++require __DIR__ . '/../lib.php';
++$f = 'lockret'; @mkdir($f);
++foreach (glob("$f/*") as $x) unlink($x);
++foreach ([['261001000001', 1000], ['261001000002', 2000], ['261001000003', 3000]] as [$id, $mt]) {
++    file_put_contents("$f/$id.html", "<html><head><title>t$id </title></head><body><dl><dt>1<font size=+2 color=red><b>t$id </b></font>投稿者：<font color=forestgreen><b>x </b></font><font size=-1>　投稿日：d</font><br><dd>b </dl>\n" . reply_form($id) . "</body></html>\n");
++    touch("$f/$id.html", 1700000000 + $mt);
++}
++thread_set_lock($f, '261001000001', true);   // いちばん古いスレッドに鍵をかける
++touch("$f/261001000001.html", 1700000000 + 1000);   // 鍵をかけるとファイルを書くので、更新日時を元に戻す (古いままにする)
++echo 'before: ', file_exists("$f/261001000001.lock") ? 'lock あり' : 'lock なし', "\n";
++regen_index($f, 1, false, false);
++$ok = file_exists("$f/o261001000001.html") && !file_exists("$f/261001000001.html") && !file_exists("$f/261001000001.lock");
++echo 'after : ', $ok ? 'OK  退避され、.lock も消えた' : 'NG', "\n";
++echo '残り  : ', implode(' ', array_diff(scandir($f), ['.', '..'])), "\n";
++foreach (glob("$f/*") as $x) unlink($x); rmdir($f);
++exit($ok ? 0 : 1);
+diff --git a/tests/lock_test.py b/tests/lock_test.py
+new file mode 100644
+index 0000000..ceeeb87
+--- /dev/null
++++ b/tests/lock_test.py
+@@ -0,0 +1,147 @@
++# 鍵つきスレッドの結合テスト (PHP 版だけ)。
++# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動、config.php で POST_INTERVAL/GLOBAL_WINDOW=0、
++#       管理用パスワード adminpw の delpass.txt、板 adm と main がある
++import os, re, sys, time, urllib.request, urllib.parse, urllib.error
++from concurrent.futures import ThreadPoolExecutor
++PH, URL = '/tmp/phpt', 'http://127.0.0.1:8123'
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *a, **k): return None
++OP = urllib.request.build_opener(NoRedirect)
++def req(path, body=None, ip='9.9.9.9'):
++    r = urllib.request.Request(URL + path, data=body.encode() if body is not None else None, headers={'CF-Connecting-IP': ip})
++    try:
++        with OP.open(r) as f: return f.status, f.read().decode('utf-8', 'replace')
++    except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8', 'replace')
++def q(**kw): return urllib.parse.urlencode(kw)
++ctr = [0]
++def ip():
++    ctr[0] += 1; return f'10.{ctr[0] // 250}.{ctr[0] % 250}.7'
++def post(folder, res, name, comm, key=None, subj=None):
++    d = dict(folder=folder, name=name, comm=comm)
++    if res: d['res'] = res
++    if subj: d['subj'] = subj
++    if key is not None: d['key'] = key
++    c, t = req('/amezo.cgi', q(**d), ip())
++    m = re.search(r'<h2>(.*?)</h2>', t)
++    return c, (m.group(1) if m else '')
++def adm(act, folder, res, **kw):
++    c, t = req('/admin.cgi', q(act=act, folder=folder, res=res, adminpass='adminpw', **kw), ip())
++    return t
++def msgs(t): return re.findall(r'<div class="msg[^"]*">(.*?)</div>', t)
++def newthread(folder, subj):
++    c, e = post(folder, None, 'owner', 'first', subj=subj); time.sleep(1.1)
++    ids = sorted(f[:-5] for f in os.listdir(f'{PH}/{folder}') if re.fullmatch(r'\d{12}\.html', f))
++    return ids[-1]
++def read(folder, res): return open(f'{PH}/{folder}/{res}.html', encoding='utf-8').read()
++def issued(t):
++    m = re.search(r'<code>([A-Z2-7]{4}(?:-[A-Z2-7]{4}){5})</code>', t); return m.group(1) if m else None
++
++for d in ('adm', 'main'):
++    for f in os.listdir(f'{PH}/{d}'): os.unlink(f'{PH}/{d}/{f}')
++if os.path.exists(f'{PH}/global.mem'): os.unlink(f'{PH}/global.mem')
++
++T = newthread('adm', 'locked one'); T2 = newthread('adm', 'locked two'); M = newthread('main', 'other board')
++ok('最初は鍵なしで書き込める (デフォルト)', post('adm', T, 'a', 'open post 1') == (303, ''))
++ok('最初は .lock も keys.txt も無い', not os.path.exists(f'{PH}/adm/{T}.lock') and not os.path.exists(f'{PH}/adm/keys.txt'))
++ok('最初のフォームに認証キー欄が無い', 'name="key"' not in read('adm', T))
++
++# --- 鍵をかける前に、キーを発行する ---
++t = adm('issue', 'adm', T, label='Alice', scope='thread'); K1 = issued(t)
++ok('鍵をかける前でもキーを発行できる (1度だけ表示)', K1 is not None, str(K1))
++ok('発行しても、まだ鍵はかからない', post('adm', T, 'a', 'still open') == (303, '') and not os.path.exists(f'{PH}/adm/{T}.lock'))
++t2 = adm('keys', 'adm', T)
++ok('再表示するとキー本体は出ない (ハッシュだけ保存)', K1 not in t2 and K1.replace('-', '') not in t2)
++ok('keys.txt にキー本体が無い', K1.replace('-', '') not in open(f'{PH}/adm/keys.txt', encoding='utf-8').read())
++
++# --- 鍵をかける ---
++t = adm('lock', 'adm', T)
++ok('鍵をかけた (メッセージ)', any('鍵をかけました' in m for m in msgs(t)), str(msgs(t)))
++ok('.lock ができた', os.path.exists(f'{PH}/adm/{T}.lock'))
++f = read('adm', T)
++ok('スレッドの返信フォームに認証キー欄が出る', f.count('name="key"') == 1 and f.count('<form') == 1 and f.endswith('</form></body></html>\n'))
++ok('レス番号は崩れていない', re.findall(r'<dt>(\d+)', f) == ['1', '2', '3'], str(re.findall(r'<dt>(\d+)', f)))
++idx = open(f'{PH}/adm/index.html', encoding='utf-8').read()
++ok('板の index: 鍵つきスレッドだけに欄が出る', idx.count('name="key"') == 1, str(idx.count('name="key"')))
++c, v = req('/amezo.cgi', q(folder='adm', res=T, sub='x', **{'from': 1}))
++ok('res_view (レス全部) にも認証キー欄が出る', 'name="key"' in v and 'name="folder"' in v)
++
++# --- 鍵つきスレッドへの書き込み ---
++ok('キーなし → 拒否 (再読み込みを促す)', post('adm', T, 'x', 'no key') == (200, 'このスレッドは認証キーが必要です。ページを再読み込みして、認証キーの欄に入力してください。'))
++ok('間違ったキー → 拒否', post('adm', T, 'x', 'bad', key='AAAA-AAAA-AAAA-AAAA-AAAA-AAAA')[1] == '認証キーが正しくありません。')
++ok('形が違うキー → 同じ拒否 (区別しない)', post('adm', T, 'x', 'bad2', key='abc')[1] == '認証キーが正しくありません。')
++n_before = len(re.findall(r'<dt>', read('adm', T)))
++ok('正しいキー → 書き込める', post('adm', T, 'alice', 'with key', key=K1) == (303, ''))
++ok('小文字・空白区切りのキーでも書き込める', post('adm', T, 'alice', 'with key 2', key=K1.lower().replace('-', ' ')) == (303, ''))
++f = read('adm', T)
++ok('拒否した投稿は書かれていない / 許可した投稿は書かれた', 'no key' not in f and 'bad2' not in f and 'with key 2' in f and len(re.findall(r'<dt>', f)) == n_before + 2)
++ok('書き込み後も、フォームに認証キー欄が残る', f.count('name="key"') == 1 and f.count('<form') == 1)
++ok('鍵つきスレッドの書き込みは、鍵のない別スレッドと独立', post('adm', T2, 'a', 'T2 open') == (303, ''))
++
++# --- 範囲 ---
++t = adm('lock', 'adm', T2)
++ok('スレッド専用キーは、別の鍵つきスレッドでは使えない', post('adm', T2, 'a', 'use K1 on T2', key=K1)[1] == '認証キーが正しくありません。')
++t = adm('issue', 'adm', T, label='Board key', scope='board'); K2 = issued(t)
++ok('板全体のキーを発行した', K2 is not None)
++ok('板全体のキーは、どの鍵つきスレッドでも使える', post('adm', T, 'b', 'K2 on T', key=K2) == (303, '') and post('adm', T2, 'b', 'K2 on T2', key=K2) == (303, ''))
++ok('板のキーは、別の板の鍵つきスレッドでは使えない', (adm('lock', 'main', M), post('main', M, 'b', 'K2 on main', key=K2))[1][1] == '認証キーが正しくありません。')
++ok('別の板の keys.txt は作られない', not os.path.exists(f'{PH}/main/keys.txt'))
++
++# --- 失効 ---
++id1 = K1.replace('-', '')[:4]
++t = adm('revoke', 'adm', T, id=id1)
++ok('失効した', any('失効しました' in m for m in msgs(t)), str(msgs(t)))
++ok('失効したキーは使えない (拒否の文言は同じ)', post('adm', T, 'alice', 'after revoke', key=K1)[1] == '認証キーが正しくありません。')
++ok('他のキーは影響を受けない', post('adm', T, 'b', 'K2 still ok', key=K2) == (303, ''))
++t = adm('revoke', 'adm', T, id=id1)
++ok('もう一度失効はエラー表示', any('失効できませんでした' in m for m in msgs(t)), str(msgs(t)))
++t = adm('revoke', 'adm', T, id='zz')
++ok('不正な ID はエラー表示', any('失効できませんでした' in m for m in msgs(t)))
++
++# --- 鍵を外す ---
++t = adm('unlock', 'adm', T)
++ok('鍵を外した', any('鍵を外しました' in m for m in msgs(t)) and not os.path.exists(f'{PH}/adm/{T}.lock'))
++f = read('adm', T)
++ok('フォームから認証キー欄が消えた', 'name="key"' not in f and f.count('<form') == 1 and f.endswith('</form></body></html>\n'))
++ok('鍵を外すと、キーなしでも書き込める', post('adm', T, 'free', 'open again') == (303, ''))
++ok('鍵なしのスレッドに間違ったキーを付けても書き込める (無視される)', post('adm', T, 'free', 'ignored key', key='nonsense') == (303, ''))
++idx = open(f'{PH}/adm/index.html', encoding='utf-8').read()
++ok('index も更新された (T の欄が消え、T2 の欄は残る)', idx.count('name="key"') == 1)
++
++# --- 管理画面の表示 ---
++t = adm('threads', 'adm', '1') if False else req('/admin.cgi', q(act='threads', folder='adm', adminpass='adminpw'), ip())[1]
++ok('スレッド一覧に 🔒 が出る (鍵つきの T2 だけ)', t.count('🔒') == 1)
++ok('管理画面: パスワードなしでは鍵の管理に入れない', 'type="password"' in req('/admin.cgi', q(act='keys', folder='adm', res=T), ip())[1])
++
++# --- 配信されない ---
++for path in [f'/adm/{T2}.lock', '/adm/keys.txt', '/adm/keys.lock', '/key_secret.txt', '/trip_secret.txt']:
++    ok(f'{path} は 404', req(path)[0] == 404)
++
++# --- 同時: 鍵のかけ外しと投稿が重なっても、フォームと実際の状態がずれない ---
++C = newthread('adm', 'race'); Kc = issued(adm('issue', 'adm', C, label='race', scope='thread'))
++results = []
++def worker(i):
++    key = Kc if i % 2 == 0 else None
++    c, e = post('adm', C, f'w{i}', f'race post {i}', key=key)
++    return i, key is not None, c, e
++def toggler():
++    for n in range(12):
++        adm('lock' if n % 2 == 0 else 'unlock', 'adm', C); time.sleep(0.02)
++    adm('lock', 'adm', C)                       # 最後は鍵つき
++with ThreadPoolExecutor(max_workers=12) as ex:
++    tf = ex.submit(toggler)
++    results = list(ex.map(worker, range(60)))
++    tf.result()
++f = read('adm', C)
++nums = [int(x) for x in re.findall(r'<dt>(\d+)', f)]
++okposts = [i for i, _, c, _ in results if c == 303]
++ok('同時: 返信フォームは1つ・末尾が正しい・番号は連番', f.count('<form') == 1 and f.endswith('</form></body></html>\n') and nums == list(range(1, len(nums) + 1)), f'{len(nums)}レス')
++ok('同時: 受け付けた投稿が全部書かれ、拒否した投稿は書かれていない',
++   all((f'race post {i} ' in f) == (c == 303) for i, _, c, _ in results), f'受付 {len(okposts)}/60')
++ok('同時: キーつきの投稿は、鍵のかけ外しの最中でも全部通る', all(c == 303 for i, hk, c, _ in results if hk))
++ok('同時: 最終状態の .lock とフォームの欄が一致', os.path.exists(f'{PH}/adm/{C}.lock') and f.count('name="key"') == 1)
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
+diff --git a/tests/unit.php b/tests/unit.php
+index becfd29..b4fc0c4 100644
+--- a/tests/unit.php
++++ b/tests/unit.php
+@@ -62,5 +62,108 @@ foreach (["bad,c\r\n\r\nspam\n日本語,n\n", "a\nb", "", "\n\n", "x,c\r\ny\r\n"
+ }
+ unlink('ng.txt'); chk('ng_lines ファイルなし', iterator_to_array(ng_lines(), false), [], 'none');
+ chdir($cwd); rmdir($tdir);
++// ---- 認証キー ----
++chk('base32 RFC4648 foobar', base32_encode_bytes('foobar'), 'MZXW6YTBOI', 'rfc');
++chk('base32 RFC4648 fo', base32_encode_bytes('fo'), 'MZXQ', 'rfc');
++chk('base32 ゼロ5バイト', base32_encode_bytes("\0\0\0\0\0"), 'AAAAAAAA', 'zero');
++chk('base32 15バイト=24文字', strlen(base32_encode_bytes(random_bytes(15))), 24, '15');
++chk('key_normalize 小文字・ハイフン・空白', key_normalize('abcd-efgh ijkl-mnop-qrst-uvwx'), 'ABCDEFGHIJKLMNOPQRSTUVWX', 'norm');
++chk('key_normalize 短い', key_normalize('ABCD-EFGH'), null, 'short');
++chk('key_normalize 使えない文字 (0,1,8,9) が入ると長さが足りない', key_normalize('ABCD-EFGH-IJKL-MNOP-QRST-UV01'), null, '01');
++chk('key_display', key_display('ABCDEFGHIJKLMNOPQRSTUVWX'), 'ABCD-EFGH-IJKL-MNOP-QRST-UVWX', 'disp');
++
++$kd = '_utest_keys_' . getmypid(); mkdir($kd); mkdir($kd . '_b');
++$k1 = key_issue($kd, 'Alice', '123');
++$k2 = key_issue($kd, "Bob\tとタブ\n改行", '*');
++chk('key_issue は表示用の形を返す', (bool)preg_match('/^([A-Z2-7]{4}-){5}[A-Z2-7]{4}$/', (string)$k1), true, $k1);
++chk('スレッド専用キーは そのスレッドで有効', key_verify($kd, '123', (string)$k1), true, 'ok');
++chk('スレッド専用キーは 別スレッドで無効', key_verify($kd, '456', (string)$k1), false, 'scope');
++chk('板全体のキーは どのスレッドでも有効', key_verify($kd, '456', (string)$k2) && key_verify($kd, '123', (string)$k2), true, 'board');
++chk('小文字・空白区切りでも有効', key_verify($kd, '123', strtolower(str_replace('-', ' ', (string)$k1))), true, 'fmt');
++$bad = (string)$k1; $bad[strlen($bad) - 1] = $bad[strlen($bad) - 1] === 'A' ? 'B' : 'A';
++chk('1文字違うと無効', key_verify($kd, '123', $bad), false, 'wrong');
++chk('空・形が違うと無効', key_verify($kd, '123', '') || key_verify($kd, '123', 'abc'), false, 'empty');
++chk('別の板 (keys.txt が無い) では無効', key_verify($kd . '_b', '123', (string)$k1), false, 'board');
++$rows = keys_load($kd);
++chk('ラベルの制御文字は空白にされる', $rows[1]['label'], 'Bob とタブ 改行', 'label');
++key_issue($kd, str_repeat('あ', 60), '5'); key_issue($kd, '', '5');
++$rows = keys_load($kd);
++chk('ラベル40文字に切る', mb_strlen($rows[2]['label']), 40, 'len');
++chk('ラベルが空なら (無題)', $rows[3]['label'], '(無題)', 'empty label');
++chk('範囲が不正なら発行しない', key_issue($kd, 'x', 'abc'), null, 'scope');
++chk('keys.txt にキー本体は残らない', str_contains((string)file_get_contents("$kd/keys.txt"), str_replace('-', '', (string)$k1)), false, 'plain');
++chk('keys.txt の権限 0600', substr(sprintf('%o', fileperms("$kd/keys.txt")), -4), '0600', 'perm');
++$id1 = substr(str_replace('-', '', (string)$k1), 0, 4);
++chk('失効できる', key_revoke($kd, $id1), true, 'revoke');
++chk('失効したキーは無効', key_verify($kd, '123', (string)$k1), false, 'revoked');
++chk('失効済みをもう一度失効は false', key_revoke($kd, $id1), false, 'again');
++chk('存在しない ID の失効は false', key_revoke($kd, 'ZZZZ'), false, 'none');
++chk('別のキーは失効の影響を受けない', key_verify($kd, '456', (string)$k2), true, 'other');
++foreach (glob("$kd/*") as $f) unlink($f); rmdir($kd); rmdir($kd . '_b');
++// ---- URL のリンク化 (入力 -> 期待) ----
++$A = ' target="_blank" rel="noopener noreferrer nofollow"';
++$lk = static fn(string $href, string $dsp = null): string => '<a href="' . $href . '"' . $A . '>' . ($dsp ?? $href) . '</a>';
++$urlcases = [
++    ['http://example.com見てね',                    $lk('http://example.com') . '見てね'],
++    ['http://example.com. 次',                      $lk('http://example.com') . '. 次'],
++    ['<http://example.com>',                        '&lt;' . $lk('http://example.com') . '&gt;'],
++    ['"http://example.com"',                        '&quot;' . $lk('http://example.com') . '&quot;'],
++    ["'https://a.com/x'",                           '&#39;' . $lk('https://a.com/x') . '&#39;'],
++    ['https://en.wikipedia.org/wiki/PHP_(language)', $lk('https://en.wikipedia.org/wiki/PHP_(language)')],
++    ['https://ja.wikipedia.org/wiki/PHP_(言語)',     $lk('https://ja.wikipedia.org/wiki/PHP_') . '(言語)'],
++    ['(https://a.com/x)',                           '(' . $lk('https://a.com/x') . ')'],
++    ['https://a.com/x),',                           $lk('https://a.com/x') . '),'],
++    ['[https://a.com/x]',                           '[' . $lk('https://a.com/x') . ']'],
++    ['https://[::1]/x',                             $lk('https://[::1]/x')],
++    ["https://a.com/it's",                          $lk('https://a.com/it&#39;s')],
++    ['see https://a.com/?x=1&y=2 ok',               'see ' . $lk('https://a.com/?x=1&amp;y=2') . ' ok'],
++    ['https://example.com/%E6%97%A5%E6%9C%AC',      $lk('https://example.com/%E6%97%A5%E6%9C%AC')],
++    ['a http://x.com b https://y.com/z!',           'a ' . $lk('http://x.com') . ' b ' . $lk('https://y.com/z') . '!'],
++    ['http:evil',                                   'http:evil'],
++    ['javascript:alert(1)',                         'javascript:alert(1)'],
++    ['https://',                                    'https://'],
++    ['http://',                                     'http://'],
++    ['https://-bad.com',                            'https://-bad.com'],
++    ['ftp://a.com/x',                               'ftp://a.com/x'],
++    ['http://a.com&gt;x',                           $lk('http://a.com&amp;gt;x')],
++];
++foreach ($urlcases as [$in, $want]) chk('URL: ' . $in, linkify_urls(html_escape($in), false), $want, $in);
++chk('URL: <br> で止まる', linkify_urls('http://x.com<br>next', false), $lk('http://x.com') . '<br>next', 'br');
++$evil = linkify_urls(html_escape('https://a.com/x," onmouseover="alert(1)'), false);
++chk('URL: 属性を抜け出せない', (bool)preg_match('/<[^>]*onmouseover/', $evil), false, $evil);
++chk('URL: 長い URL (400文字) も最後まで', linkify_urls(html_escape('https://a.com/' . str_repeat('a', 386)), false), $lk('https://a.com/' . str_repeat('a', 386)), 'long');
++$t0 = microtime(true); linkify_urls(html_escape(str_repeat('http://a.com/((((((((', 40)));
++chk('URL: 悪意のある入力でも遅くならない (50ms以内)', microtime(true) - $t0 < 0.05, true, 'redos');
++// ---- 中継ページ (jump) ----
++foreach (['https://a.com/x?y=1&z=2', "https://a.com/it's", 'https://[::1]/x', 'http://a.com'] as $u) chk("url_is_valid ok: $u", url_is_valid($u), true, $u);
++foreach (['', 'javascript:alert(1)', 'http://', 'https://-a.com', "https://a.com/ x", 'https://a.com/"', 'https://a.com/<b>', "https://a.com/\n", 'ftp://a.com',
++          'https://a.com/' . str_repeat('a', 2100), "https://a.com/\x00", 'https://a.com/日本'] as $u) chk('url_is_valid 不可: ' . substr(json_encode($u), 0, 30), url_is_valid($u), false, $u);
++chk('b64url 往復', b64url_decode(b64url_encode("https://a.com/?x=1&y=日")), "https://a.com/?x=1&y=日", 'rt');
++foreach (['', 'a b', 'ab=', '+/', 'ab!', "ab\n"] as $bad) chk('b64url_decode 拒否: ' . json_encode($bad), b64url_decode($bad), null, $bad);
++$u0 = 'https://a.com/?x=1&y=2';
++$sig = jump_sign($u0);
++chk('署名は22文字 (base64url)', (bool)preg_match('/^[A-Za-z0-9_-]{22}$/', $sig), true, $sig);
++chk('署名は同じ URL なら同じ', jump_sign($u0), $sig, 'det');
++chk('署名は URL が違えば違う', jump_sign($u0 . 'x') !== $sig, true, 'diff');
++chk('署名の検証', jump_verify($u0, $sig), true, 'verify');
++chk('URL を変えると通らない', jump_verify($u0 . 'x', $sig), false, 'tamper url');
++$sig2 = $sig; $sig2[21] = $sig2[21] === 'A' ? 'B' : 'A';
++chk('署名を1文字変えると通らない', jump_verify($u0, $sig2), false, 'tamper sig');
++chk('署名が空・短いと通らない', jump_verify($u0, '') || jump_verify($u0, substr($sig, 0, 10)), false, 'short');
++chk('署名が合っても、URL として不正なら通らない', jump_verify('javascript:alert(1)', jump_sign('javascript:alert(1)')), false, 'js');
++chk('中継の秘密鍵は、トリップ・ID・キーとは別のファイル', count(array_unique([file_get_contents(JUMP_SECRET_FILE), file_get_contents(TRIP_SECRET_FILE), file_get_contents(ID_SECRET_FILE)])), 3, 'keys');
++$out = linkify_urls(html_escape('see https://a.com/?x=1&y=2 ok'), true);
++preg_match('/href="([^"]+)"/', $out, $hm);
++parse_str((string)parse_url(html_entity_decode($hm[1]), PHP_URL_QUERY), $q);
++chk('中継リンク: href は ../jump.cgi', str_starts_with($hm[1], '../jump.cgi?u='), true, $hm[1]);
++chk('中継リンク: 直リンクが href に入っていない', str_contains($hm[1], 'a.com'), false, $hm[1]);
++chk('中継リンク: u を戻すと元の URL', b64url_decode($q['u'] ?? ''), 'https://a.com/?x=1&y=2', 'u');
++chk('中継リンク: 署名が合う', jump_verify((string)b64url_decode($q['u'] ?? ''), $q['s'] ?? ''), true, 's');
++chk('中継リンク: 表示する文字は元の URL', str_contains($out, '>https://a.com/?x=1&amp;y=2</a>'), true, $out);
++chk('中継リンク: target/rel が付く', str_contains($out, 'target="_blank" rel="noopener noreferrer nofollow"'), true, 'rel');
++chk('中継リンク: 同じ本文は同じ出力 (二重投稿の判定が効く)', linkify_urls(html_escape('x https://a.com/b'), true), linkify_urls(html_escape('x https://a.com/b'), true), 'same');
++chk('中継リンク: 直リンク指定 (false) は元の形', str_contains(linkify_urls('https://a.com/x', false), 'href="https://a.com/x"'), true, 'direct');
++$evil2 = linkify_urls(html_escape('https://a.com/x," onmouseover="alert(1)'), true);
++chk('中継リンク: 属性を抜け出せない', (bool)preg_match('/<[^>]*onmouseover/', $evil2), false, $evil2);
+ echo "$n checks, $fail failed\n";
+ exit($fail ? 1 : 0);
+-- 
+2.43.0
+
