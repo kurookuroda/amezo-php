@@ -177,7 +177,7 @@ def check_flock():
 
 def setup_bbs_directories():
     print("📂 BBS用のディレクトリを確認しています...")
-    for needed in ["router.php", "lib.php", "amezo.php", "dai.php", "admin.php", "hide.js",
+    for needed in ["router.php", "lib.php", "amezo.php", "dai.php", "admin.php", "jump.php", "hide.js",
                    "index.html", "style.css", "header.html", "blist.txt"]:
         if not os.path.exists(needed):
             print(f"  ⚠️ {needed} が見つかりません")
@@ -267,9 +267,10 @@ def self_check(port):
     """起動直後の確認: 板一覧は出る / 鍵やパスワードや PHP のソースは配られない"""
     print("🔎 起動チェック:")
     good = True
-    for path, want in [("/dai.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
+    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
                        ("/trip_secret.txt", 404), ("/id_secret.txt", 404), ("/delpass.txt", 404),
-                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404)]:
+                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404),
+                       ("/key_secret.txt", 404), ("/jump_secret.txt", 404)]:
         got = http_status(port, path)
         mark = "✅" if got == want else "❌"
         if got != want:

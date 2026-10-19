@@ -1,0 +1,168 @@
+From 9197a6ba8ce760d80e24cbdc1ea380e938cd1010 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 04:40:21 +0000
+Subject: [PATCH] =?UTF-8?q?router.php:=20=E3=83=91=E3=82=B9=E3=81=AE?=
+ =?UTF-8?q?=E9=A3=9F=E3=81=84=E9=81=95=E3=81=84=E3=81=A7=20.php=20?=
+ =?UTF-8?q?=E3=81=8C=E5=AE=9F=E8=A1=8C=E3=81=A7=E3=81=8D=E3=81=A6=E3=81=97?=
+ =?UTF-8?q?=E3=81=BE=E3=81=86=E4=B8=8D=E5=85=B7=E5=90=88=E3=82=92=E4=BF=AE?=
+ =?UTF-8?q?=E6=AD=A3=20+=20webshell=20=E5=AF=BE=E7=AD=96=E3=81=AE=E5=9B=9E?=
+ =?UTF-8?q?=E5=B8=B0=E3=83=86=E3=82=B9=E3=83=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- parse_url('//shell.php') は「ホスト名 shell.php」と読んでパスを null にするため、router は '/' (許可リスト内) と判断して
+  return false するが、組み込みサーバーは生の '//shell.php' を実際のファイルとして開き、PHP なら実行していた
+  (ルート直下の .php だけが対象。//lib.php //config.php などが直接実行でき、.phtml はソースが文字で返った)
+- parse_url を使わず REQUEST_URI の「?」より前をそのまま使い、'//'、'%'、'\\'、'.' '..' の区間、NUL、
+  '/' で始まらない形 (http://… の絶対形式) を 400 で止める。router が判定するパスと、サーバーが開くパスを同じにする
+- tests/webshell_test.py を追加: 実行できる形の PHP を置いたと仮定して、50通りの経路が実行されないこと、
+  許可リストの静的 .html は PHP コードが文字のまま返ること、本来の経路が動くことを確認 (修正前は8件失敗)
+- README に「セキュリティ (webshell 対策)」の節を追加 (層ごとの対策、推奨の PHP 起動オプション、まだ弱いところ)
+---
+ README.md              | 40 +++++++++++++++++++++++++++++++++
+ router.php             | 11 +++++++--
+ tests/webshell_test.py | 51 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 100 insertions(+), 2 deletions(-)
+ create mode 100644 tests/webshell_test.py
+
+diff --git a/README.md b/README.md
+index dd53753..0d40f21 100644
+--- a/README.md
++++ b/README.md
+@@ -64,6 +64,45 @@ sh run.sh                 # http://127.0.0.1:8000/
+ - 文字列の連結 (`.=`) を配列 + `implode` に変えても、メモリは減らない (20万片で 9.0MB → 16.0MB)。`regen_index` は文字列に溜めず、`fwrite` で書き出している。
+ - cloudflared のメモリは測っていない。
+ 
++## セキュリティ (webshell 対策)
++
++webshell = 攻撃者が置いた(または書き込ませた) PHP を、あとから実行される形で残すこと。このアプリでは、次の層で防いでいる。
++
++**1. 置かせない (入口)**
++- ファイルのアップロード機能が無い。`eval` `system` `exec` `unserialize` `include` (変数のパス) など、コード実行につながる関数をアプリ本体で使っていない (走査で確認)。
++- ファイルを書く・消す・名前を変える操作のパスは、`blist.txt` に載っている板名、数字だけのスレッド番号、定数だけから作る。攻撃者が名前を選べる書き込みは無い。
++- 投稿の全フィールド (名前・メール・題名・本文) は、保存前にエスケープする。`<?php` `<?=` `<%` `<script language="php">` は文字になる (`.html` を PHP として処理する設定ミスがあっても実行されない)。
++
++**2. 置かれても実行させない (配信の入口: `router.php`)**
++- 実行するのは `/amezo` `/dai` `/admin` `/jump` の `.cgi` / `.php` だけ。静的ファイルは許可リスト (`index.html` `数字.html` `o数字.html` `kako.html` `style.css` `hide.js` `ad.html`) だけ。ほかは 404。
++- 板フォルダに `shell.php` `.phtml` `.php5` `.phar` `.htaccess` を置かれても 404。許可リストの `.html` に PHP のコードが入っていても、文字のまま返る (実行されない)。
++- **`//shell.php` で、ルート直下の `.php` が実行できてしまう不具合を直した**: `parse_url('//shell.php')` は「ホスト名」と読んでパスが null になり、router は `/` (許可) と判断する一方で、サーバーは生の `//shell.php` を実際のファイルとして開いていた。
++  いまは `parse_url` を使わず、`//`、`%`、`\`、`.` `..` の区間、NUL、`/` で始まらない形 (`http://…`) を 400 で止める。本来の経路は、どれもこれらを使わない。
++  `tests/webshell_test.py` が、この種の経路 (50通り) を毎回確かめる。
++
++**3. 実行されても被害を小さくする (PHP の起動オプション)**
++`php -S` の起動に、次を付けても、アプリの全テストが通ることを確認した。コードを実行できた攻撃者が、コマンド実行・外への接続・アプリの外のファイルの読み書きをできなくなる。
++
++```
++php -n -d extension=<mbstring.so> -d extension=<ctype.so> -d memory_limit=32M -d expose_php=0 \
++    -d allow_url_fopen=0 -d allow_url_include=0 -d open_basedir=<アプリのフォルダ>:/tmp \
++    -d disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,dl,mail,show_source,highlight_file,phpinfo,\
++posix_kill,posix_setuid,posix_setgid,posix_mkfifo,symlink,link,putenv,fsockopen,pfsockopen,stream_socket_client,\
++stream_socket_server,stream_socket_pair,socket_create,socket_create_listen,curl_exec,curl_multi_exec,proc_nice,proc_terminate,proc_get_status \
++    -S 127.0.0.1:8000 router.php
++```
++
++(`setup_expose.py` の既定にはまだ入れていない。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、`disable_functions` の影響は受けない。)
++
++**4. 見つける・気づく**
++- 板フォルダに置かれるファイル名は決まっている (`数字.html`、`x数字.html`、`o数字.html`、`数字.lock`、`index数字.html`、`kako.html`、`kako.txt`、`keys.txt`、`keys.lock`、`lasttime.txt`、`regen.lock`)。これ以外のファイルがあれば異常。
++  板の `.html` / `.txt` に生の `<?` や `<%` があれば異常 (エスケープ済みなので、正常なら入らない)。コードのハッシュを控えておけば、書き換えも分かる。
++
++**まだ弱いところ**
++- `lib.php` は、`config.php` があれば自動で `require` する。アプリのフォルダは PHP が書き込める場所なので、将来、書き込みの穴が見つかったときに、そのまま常駐の足がかりになる。設定を PHP ファイルでなく、実行されない形式 (ini / JSON) にするのが望ましい。
++- Colab では PHP が root で動き、コードと同じフォルダに鍵やデータが書かれる。コードを読み取り専用にする、データのフォルダを分ける、非 root で動かす、Google ドライブを同じランタイムにマウントしない、が望ましい。
++- `setup_expose.py` が取得する `cloudflared` は、チェックサムを確かめていない。
++
+ ## 設定
+ 
+ `config.php` (任意。`.gitignore` 済み) に `define('POST_INTERVAL', 3);` のように書くと、`lib.php` 冒頭の既定値を上書きできる。
+@@ -161,6 +200,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ 
+ - `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離) を合わせた 214 項目が一致。
+ - `tests/e2e.sh` + `tests/cmp.py`: 同じ投稿 25 通りを Python 版と PHP 版に流し、エラー文言と生成 HTML (スレッド・index・過去ログ) が一致 (日時・ID・番号などは正規化)。
++- `tests/webshell_test.py`: 実行できる形の PHP を置かれたと仮定して、`//x.php` `%2e%2e` `\\` 絶対形式など50通りの経路が、実行されない (404/400、静的 `.html` は文字のまま) こと、本来の経路が動くことを確認。
+ - `tests/jump_test.py`: 中継ページ (リンクの形、署名の検証、改ざん・ランダムな署名・壊れた入力が通らないこと、鍵を失った場合、広告枠、`res_view` の相対パス、配信) を確認。
+ - `tests/lock_test.py` と `tests/lock_retire.php`: 鍵つきスレッド (鍵をかける前後の発行、書き込みの可否、範囲、失効、鍵を外す、フォームの差し替え、配信されないこと、同時のかけ外し、退避時の `.lock`) を確認。
+ - `tests/pager.sh` と `tests/unit.php`: ページ送り (実在するページだけ、範囲外は最後のページ、前へ/次への出し分け、1ページの板では出さない、11ページ以上の省略表示、ファイル数) を確認。
+diff --git a/router.php b/router.php
+index 2a9d99b..8777415 100644
+--- a/router.php
++++ b/router.php
+@@ -5,8 +5,15 @@
+ //
+ //   PHP_CLI_SERVER_WORKERS=2 php -S 127.0.0.1:8000 router.php
+ //
+-$path = rawurldecode(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/');
+-if (str_contains($path, "\0") || str_contains($path, '..') || str_contains($path, '\\')) {
++// REQUEST_URI の「?」より前を、そのまま使う。parse_url() は使わない。
++// parse_url('//shell.php') は「ホスト名 shell.php」と読んでパスを null にするので、router は '/' (許可リスト内) と判断して
++// return false するのに、サーバーは生の '//shell.php' を実際のファイルとして開き、PHP なら実行してしまう。
++// router が判定するパスと、サーバーが開くパスを同じにする: '//'、'%' (パーセントエンコード)、'\'、'.' '..' の区間、NUL、
++// '/' で始まらない形 (http://… の絶対形式) は、すべて 400 で止める。本来の経路 (板・スレッド・jump.cgi) はどれも使わない形。
++$path = (string)($_SERVER['REQUEST_URI'] ?? '/');
++if (($q = strpos($path, '?')) !== false) $path = substr($path, 0, $q);
++if ($path === '' || $path[0] !== '/' || str_contains($path, '//') || str_contains($path, '%') || str_contains($path, '\\')
++    || str_contains($path, "\0") || str_contains($path, '..') || preg_match('~(?:^|/)\.(?:/|$)~', $path)) {
+     http_response_code(400);
+     return true;
+ }
+diff --git a/tests/webshell_test.py b/tests/webshell_test.py
+new file mode 100644
+index 0000000..5d23018
+--- /dev/null
++++ b/tests/webshell_test.py
+@@ -0,0 +1,51 @@
++# webshell 対策の回帰テスト: 「実行できる形の PHP を置かれた」と仮定して、配信の入口 (router.php) が実行しないことを確かめる。
++# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動 (板 adm がある)
++import http.client, os, sys
++PH, HOST, PORT = '/tmp/phpt', '127.0.0.1', 8123
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++def raw(target, method='GET', body=None):
++    c = http.client.HTTPConnection(HOST, PORT, timeout=10)
++    try:
++        c.putrequest(method, target, skip_host=False, skip_accept_encoding=True)
++        c.putheader('CF-Connecting-IP', '9.8.7.6')
++        c.endheaders()
++        r = c.getresponse(); return r.status, r.read().decode('utf-8', 'replace')
++    except Exception as e:
++        return 0, str(e)
++    finally:
++        c.close()
++CODE = '<?php echo "EXEC-RESULT:" . (1+1); ?>\n'      # 実行されると "EXEC-RESULT:2" が出る。文字のまま返れば '<?php' が見える
++plant = [f'{PH}/probe_root.php', f'{PH}/probe_root.phtml', f'{PH}/adm/shell.php', f'{PH}/adm/shell.phtml', f'{PH}/adm/shell.php5',
++         f'{PH}/adm/shell.phar', f'{PH}/adm/.htaccess', f'{PH}/adm/999999999999.html', f'{PH}/adm/index99.html', f'{PH}/adm/o111.html']
++for p in plant: open(p, 'w').write(CODE)
++try:
++    # --- 1. 実行されてはいけない経路 (404 か 400 で、実行結果が出ない) ---
++    deny = ['/probe_root.php', '//probe_root.php', '///probe_root.php', '//./probe_root.php', '//probe_root.php?x=1', '//probe_root.phtml',
++            '/%70robe_root.php', '/probe_root.php%00.html', '/adm/%2e%2e/probe_root.php', '/adm/..%2fprobe_root.php', '/adm/../probe_root.php',
++            '/adm/shell.php', '/adm/shell.phtml', '/adm/shell.php5', '/adm/shell.phar', '/adm/.htaccess', '/adm//shell.php', '//adm/shell.php',
++            '/amezo.cgi/probe_root.php', '/amezo.php/x', '/adm/shell.php/amezo.cgi', '/./probe_root.php', '\\probe_root.php',
++            '//lib.php', '//router.php', '//config.php', '//admin.php/x', '/lib.php', '/config.php', '/tests/unit.php', '/jump_secret.txt', '/adm/keys.txt',
++            'http://127.0.0.1:8123/probe_root.php', 'http://127.0.0.1:8123//probe_root.php']
++    for t in deny:
++        c, b = raw(t)
++        allowed = (400, 404) + ((0,) if t.startswith('\\') else ())     # '\\' で始まるのは HTTP として不正。サーバーが接続を切ってもよい (実行されなければよい)
++        ok(f'実行されない: {t}', 'EXEC-RESULT:2' not in b and c in allowed, f'HTTP {c}')
++    # --- 2. 許可リストの静的ファイルは、中身が PHP でも文字のまま返る (実行されない) ---
++    for t in ['/adm/999999999999.html', '/adm/index99.html', '/adm/o111.html']:
++        c, b = raw(t)
++        ok(f'静的 .html は文字のまま: {t}', c == 200 and b.startswith('<?php') and 'EXEC-RESULT:2' not in b, f'HTTP {c}')
++    # --- 3. 本来の経路は、これまでどおり動く ---
++    for t, want in [('/', 200), ('/style.css', 200), ('/hide.js', 200), ('/dai.cgi', 200), ('/jump.cgi', 200), ('/jump.php', 200),
++                    ('/amezo.cgi?folder=adm', 303), ('/amezo.cgi?folder=adm&page=2', 303), ('/admin.cgi', 200), ('/adm/', 200), ('/adm', 301),
++                    ('/jump.cgi?u=aHR0cHM6Ly9hLmNvbS8&s=AAAAAAAAAAAAAAAAAAAAAA', 200), ('/adm/index.html', 200)]:
++        c, b = raw(t)
++        ok(f'通常の経路: {t}', c == want, f'HTTP {c}')
++finally:
++    for p in plant:
++        try: os.unlink(p)
++        except OSError: pass
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
+-- 
+2.43.0
+

@@ -24,29 +24,6 @@ try {
     bbs_error('サーバーの設定に問題があります (鍵ファイルを読み書きできません).');
 }
 
-/** スレッドファイルの末尾から [返信フォームの位置, 最後のレス番号, 最後のレス行] を求める (全体は読まない) */
-function thread_append_pos($W): array
-{
-    $size = (int)fstat($W)['size'];
-    if ($size === 0) return [0, 0, ''];
-    $n = min($size, 65536);
-    $off = $size - $n;
-    fseek($W, $off);
-    $tail = (string)fread($W, $n);
-    $p = strrpos($tail, "\n<form");
-    if ($p === false) {                       // 返信フォームが無い (壊れている) ときは末尾に足す
-        $footer = $size;
-        $before = rtrim($tail, "\n");
-    } else {
-        $footer = $off + $p + 1;
-        $before = substr($tail, 0, $p);
-    }
-    $nl = strrpos($before, "\n");
-    $prev = $nl === false ? $before : substr($before, $nl + 1);
-    $cnt = preg_match('/<dt>(\d+)/', $prev, $m) ? (int)$m[1] : 0;
-    return [$footer, $cnt, $prev];
-}
-
 function amezo_main(): void
 {
     $content_len = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
@@ -163,9 +140,7 @@ function amezo_main(): void
         $ip = client_ip();
         if ($subj !== '') check_global_ip($ip);
 
-        $linked = preg_replace_callback('/(https?:[\w.~\-\/?+=:@%;#&]+)/u', 'url_link', $comm);
-        if ($linked === null) bbs_error('コメントを処理できません.');      // 正規表現の失敗で本文が消えるのを防ぐ
-        $comm = $linked;
+        $comm = linkify_urls($comm);
 
         $trip = '';
         if ($cap_ok) {
@@ -198,8 +173,22 @@ function amezo_main(): void
         }
 
         flock($W, LOCK_EX);
-        [$footer, $cnt, $prev] = thread_append_pos($W);
+        [$footer, $cnt, $prev] = thread_footer_info($W);
         $cnt++;
+
+        // 鍵つきスレッド: 状態の確認からフォームの書き込みまで、同じロックの中でやる (管理者の鍵のかけ外しとずれない)
+        $locked = $subj === '' && thread_is_locked($folder, $res);
+        if ($locked) {
+            $given = $form['key'] ?? '';
+            if ($given === '') {
+                fclose($W);
+                bbs_error('このスレッドは認証キーが必要です。ページを再読み込みして、認証キーの欄に入力してください。');
+            }
+            if (!key_verify($folder, $res, $given)) {
+                fclose($W);
+                bbs_error('認証キーが正しくありません。');
+            }
+        }
 
         // 二重カキコ: 直前のレスと名前・本文が同じ (1レス目は題名の後ろに名前があるので、名前の位置で拾う)
         if (preg_match('/投稿者：<font[^>]*><b>(.+?) <\/b>.+<dd>(.+?) <\/dl>/u', $prev, $pm)
@@ -221,7 +210,7 @@ function amezo_main(): void
 
         $data = "{$subj1}<dl><dt>{$cnt}{$subj2}投稿者：<font color=forestgreen><b>{$name} </b></font>"
             . "{$meta}　投稿日：{$date_str} ID:{$id}</font><br><dd>{$comm} </dl>\n"
-            . reply_form($res) . "</body></html>\n";
+            . reply_form($res, '', $locked) . "</body></html>\n";
 
         fseek($W, $footer);
         fwrite($W, $data);

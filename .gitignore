@@ -5,3 +5,7 @@ global.mem
 config.php
 admin_fail.mem
 __pycache__/
+key_secret.txt
+keys.txt
+*.lock
+jump_secret.txt

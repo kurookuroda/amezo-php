@@ -1,4 +1,4 @@
-import re, sys, glob, os, difflib
+import re, sys, glob, os, difflib, base64, html, urllib.parse
 def norm(t):
     t = re.sub(r'20\d\d年\d\d月\d\d日\([日月火水木金土]\)\d\d時\d\d分\d\d秒', 'DATE', t)
     t = re.sub(r'<font size=-1 class="meta" data-id="[^"]*"(?: data-trip="[^"]*")?>', '<font size=-1>', t)
@@ -6,6 +6,12 @@ def norm(t):
     t = t.replace('<script src="../hide.js" defer></script>', '')
     t = re.sub(r'\d{12}', 'TID', t)
     t = re.sub(r'\((?:Python|PHP) Version\)', '(X Version)', t)
+    def _jump(m):   # PHP 版の中継リンクは、u を戻した元の URL に直してから比べる
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(m.group(1))).query)
+        u = q['u'][0]
+        return 'href="' + base64.urlsafe_b64decode(u + '=' * (-len(u) % 4)).decode() + '"'
+    t = re.sub(r'href="(\.\./jump\.cgi\?[^"]*)"', _jump, t)
+    t = re.sub(r'href="([^"]*)"', lambda m: 'href="' + m.group(1).replace('&amp;', '&') + '"', t)   # URL の & の書き方の違い (PHP版は属性として正しくエスケープする)
     t = re.sub(r'<!-- AMEZO-NEXT \d+ -->\n', '', t)      # PHP 版では出さない (ページごとに別ファイルにしたため)
     # Python 版の「次のページ」入力欄は、PHP 版ではページ送り (pager) に置き換えた
     t = re.sub(r'<form method=post action="../amezo.cgi">\n<input type=submit value="次のページ">\n<input type=text name="next" value="\d+" size="3">〜</form>\n', '', t)

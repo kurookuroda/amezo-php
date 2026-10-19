@@ -26,6 +26,8 @@ td.body { max-width: 32em; word-break: break-all; }
 form.inline { display: inline; }
 .msg { padding: 6px 10px; border: 1px solid #c33; margin: 8px 0; }
 .msg.ok { border-color: #393; }
+.keybox { border: 2px solid #c60; padding: 10px 14px; margin: 10px 0; background: #fff8e8; }
+.keybox code { font-size: 1.3em; letter-spacing: 0.05em; user-select: all; }
 button { padding: 4px 12px; }
 </style>
 CSS;
@@ -275,13 +277,15 @@ function show_threads(string $pw, string $folder, string $message = '', bool $ok
     foreach (array_slice($active, 0, LIST_LIMIT) as [$mt, $res, $path]) {
         [$title, $count] = thread_summary($path);
         $rows .= '<tr><td>' . ($title !== '' ? E($title) : '(題名なし)') . "</td><td>{$count}</td><td>" . fmt_time($mt) . '</td><td>'
+            . (thread_is_locked($folder, $res) ? '🔒' : '') . '</td><td>'
             . btn($pw, 'レスを見る', ['act' => 'replies', 'folder' => $folder, 'res' => $res]) . ' '
+            . btn($pw, '鍵の管理', ['act' => 'keys', 'folder' => $folder, 'res' => $res]) . ' '
             . btn($pw, '非表示', ['act' => 'hide', 'folder' => $folder, 'res' => $res], 'このスレッドを非表示にします。よろしいですか?')
             . '</td></tr>';
     }
     $body = msg_html($message, $ok) . nav($pw);
     if ($rows !== '') {
-        $body .= '<table><tr><th>題名</th><th>レス数</th><th>更新</th><th></th></tr>' . $rows . '</table>';
+        $body .= '<table><tr><th>題名</th><th>レス数</th><th>更新</th><th>鍵</th><th></th></tr>' . $rows . '</table>';
         if (count($active) > LIST_LIMIT) {
             $body .= '<p>新しい順に ' . LIST_LIMIT . ' 件だけ表示しています (全 ' . count($active) . ' 件)。</p>';
         }
@@ -333,6 +337,52 @@ function show_replies(string $pw, string $folder, string $res, string $message =
         . '<p>' . btn($pw, 'このスレッドを非表示にする', ['act' => 'hide', 'folder' => $folder, 'res' => $res],
                       'このスレッドを非表示にします。よろしいですか?') . '</p>';
     page_foot();
+}
+
+/** 鍵の管理: 鍵のかけ外し、キーの発行・失効。発行したキーは、この画面に1度だけ出す */
+function show_keys(string $pw, string $folder, string $res, string $message = '', bool $ok = true, ?string $issued = null): never
+{
+    $path = "./$folder/$res.html";
+    if (!is_file($path)) fatal($pw, 'スレッドがありません。');
+    $fp = @fopen($path, 'r');
+    $title = $fp ? first_line_title((string)fgets($fp)) : '';
+    if ($fp) fclose($fp);
+    $locked = thread_is_locked($folder, $res);
+    $base = ['folder' => $folder, 'res' => $res];
+
+    $body = msg_html($message, $ok) . nav($pw, $folder);
+    if ($issued !== null) {
+        $body .= '<div class="keybox"><b>キーを発行しました。この画面を閉じると、二度と表示されません。</b>'
+            . '<br>いまのうちに控えて、書き込んでよい人に渡してください。<br><br><code>' . E($issued) . '</code></div>';
+    }
+    $body .= '<p>状態: <b>' . ($locked ? '🔒 鍵つき (認証キーがないと書き込めません)' : '鍵なし (誰でも書き込めます)') . '</b></p><p>'
+        . ($locked
+            ? btn($pw, '鍵を外す', ['act' => 'unlock'] + $base, 'このスレッドの鍵を外して、誰でも書き込めるようにします。よろしいですか?') . ' '
+              . btn($pw, '書き込みフォームを作り直す', ['act' => 'lock'] + $base)
+            : btn($pw, '鍵をかける', ['act' => 'lock'] + $base, 'このスレッドに鍵をかけます。キーを持たない人は書き込めなくなります。よろしいですか?'))
+        . '</p><p>※ 鍵つきでも、読むのは誰でもできます。</p>';
+
+    $rows = '';
+    foreach (keys_load($folder) as $r) {
+        if ($r['scope'] !== '*' && $r['scope'] !== $res) continue;      // このスレッドで使えるキーだけ
+        $active = $r['status'] === 'active';
+        $rows .= '<tr><td>' . E($r['id']) . '</td><td>' . E($r['label']) . '</td><td>'
+            . ($r['scope'] === '*' ? 'この板の鍵つきスレッドどれでも' : 'このスレッドだけ') . '</td><td>' . fmt_time($r['created']) . '</td><td>'
+            . ($active ? '有効' : '失効') . '</td><td>'
+            . ($active ? btn($pw, '失効', ['act' => 'revoke', 'id' => $r['id']] + $base,
+                             $r['scope'] === '*' ? 'このキーは、この板の鍵つきスレッド全部で使えなくなります。よろしいですか?' : 'このキーを失効します。よろしいですか?') : '')
+            . '</td></tr>';
+    }
+    $body .= '<h3>キー</h3>' . ($rows !== ''
+        ? '<table><tr><th>ID</th><th>ラベル</th><th>範囲</th><th>発行日時</th><th>状態</th><th></th></tr>' . $rows . '</table>'
+        : '<p>このスレッドで使えるキーはまだありません。</p>');
+    $body .= '<h3>キーを発行する</h3><form method="post" action="admin.cgi">' . hidden($pw, ['act' => 'issue'] + $base)
+        . 'ラベル (誰に渡すか。40文字まで) <input type="text" name="label" size="24"><br>'
+        . '範囲 <label><input type="radio" name="scope" value="thread" checked> このスレッドだけ</label> '
+        . '<label><input type="radio" name="scope" value="board"> この板の鍵つきスレッドどれでも</label><br>'
+        . '<button type="submit">発行</button></form>'
+        . '<p>鍵をかける前にキーを発行しても、あとから発行してもかまいません。キーは発行したときに1度だけ表示されます (サーバーにはハッシュしか残りません)。</p>';
+    page('鍵の管理: ' . ($title !== '' ? $title : '(題名なし)') . " ({$folder}/{$res})", $body);
 }
 
 // ---- 操作 ------------------------------------------------------------------
@@ -459,6 +509,21 @@ function admin_main(): void
         [$ok, $message] = do_delete($folder, $res, $nums);
         if ($ok) $message .= regen($folder);
         show_replies($pw, $folder, $res, $message, $ok);
+    } elseif ($act === 'keys') {
+        show_keys($pw, $folder, $res);
+    } elseif ($act === 'lock' || $act === 'unlock') {
+        [$ok, $message] = thread_set_lock($folder, $res, $act === 'lock');
+        if ($ok) $message .= regen($folder);
+        show_keys($pw, $folder, $res, $message, $ok);
+    } elseif ($act === 'issue') {
+        $scope = $get('scope') === 'board' ? '*' : $res;
+        $key = key_issue($folder, $get('label'), $scope);
+        if ($key === null) show_keys($pw, $folder, $res, 'キーを保存できませんでした。', false);
+        show_keys($pw, $folder, $res, '', true, $key);
+    } elseif ($act === 'revoke') {
+        $id = $get('id');
+        $ok = preg_match('/^[A-Z2-7]{4}$/', $id) && key_revoke($folder, $id);
+        show_keys($pw, $folder, $res, $ok ? "キー {$id} を失効しました。" : 'キーを失効できませんでした。', (bool)$ok);
     } elseif ($act === 'hide') {
         [$ok, $message] = do_hide($folder, $res);
         if ($ok) $message .= regen($folder);

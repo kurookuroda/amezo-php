@@ -37,6 +37,7 @@ foreach ([
     'COMM_LINES_MAX'  => 20,
     'HASH_ITERATIONS' => 100000,
     'TRUSTED_PROXIES' => ['127.0.0.1', '::1'],
+    'JUMP_ENABLED'    => true,     // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする (false なら直リンク)
 ] as $k => $v) {
     defined($k) || define($k, $v);
 }
@@ -60,6 +61,18 @@ const KAKO_FILE        = 'kako.html';
 const KAKO_LIST        = 'kako.txt';
 const KAKO_SEP         = '<>';
 const HASH_SCHEME      = 'pbkdf2_sha256';
+
+// ---- 認証キー (鍵つきスレッド) ----
+const KEY_SECRET_FILE = 'key_secret.txt';   // キーのハッシュ用の秘密鍵 (トリップ/ID とは別)
+const KEY_CTX         = 'key:';             // 公開後に変えない
+const KEYS_FILE       = 'keys.txt';         // 板ごと: <板>/keys.txt
+const KEY_ALPHABET    = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+// ---- 中継ページ (jump.php): 投稿の URL への署名つきリンク ----
+const JUMP_SECRET_FILE = 'jump_secret.txt'; // 署名用の秘密鍵 (他の鍵とは別)。失うと、投稿済みの中継リンクが全部使えなくなる
+const JUMP_CTX         = 'jump:';           // 公開後に変えない
+const JUMP_SIG_LEN     = 22;                // 署名の長さ (base64url で22文字 = 132bit)
+const URL_MAX_LEN      = 2000;
 
 const SCRIPT_TAG = '<script src="../hide.js" defer></script>';
 const COPYRIGHT  = "<!--\n    Script for amezo-like BBS (PHP Version)\n    Original Copyright (C) 1999-2003 amezo_\n    http://www17.big.or.jp/~amezo_/\n    http://ame.x0.com/\n-->\n";
@@ -345,24 +358,291 @@ function redirect(string $folder, string $index_name): never
     exit;
 }
 
-function url_link(array $m): string
+function b64url_encode(string $bin): string
 {
-    $dsp = $m[1];
-    $url = str_replace('&amp;', '&', $dsp);
-    return '<a href="' . $url . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>';
+    return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
 }
 
-/** レス用フォーム (1行で返す。スレッドファイルのパーサが行単位のため) */
-function reply_form(string $res, string $links = ''): string
+function b64url_decode(string $s): ?string
+{
+    if ($s === '' || !preg_match('/^[A-Za-z0-9_-]+$/D', $s)) return null;
+    $d = base64_decode(strtr($s, '-_', '+/'), true);
+    return $d === false ? null : $d;
+}
+
+/** 中継ページに渡してよい URL か (http/https、ホスト名は英数字か [ で始まる、使える文字は ASCII の URL 文字だけ) */
+function url_is_valid(string $url): bool
+{
+    if ($url === '' || strlen($url) > URL_MAX_LEN) return false;
+    return (bool)preg_match('/^https?:\/\/[A-Za-z0-9\[][A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()\'&]*$/D', $url);
+}
+
+/** URL の署名: HMAC-SHA256(中継用の秘密鍵, 'jump:' + URL) の先頭132bit */
+function jump_sign(string $url): string
+{
+    return substr(b64url_encode(hash_hmac('sha256', JUMP_CTX . $url, load_secret(JUMP_SECRET_FILE), true)), 0, JUMP_SIG_LEN);
+}
+
+function jump_verify(string $url, string $sig): bool
+{
+    return url_is_valid($url) && hash_equals(jump_sign($url), $sig);
+}
+
+/** スレッド HTML に書く中継リンクの href (属性用にエスケープ済み。板のフォルダの中から見た相対パス) */
+function jump_href(string $url): string
+{
+    return '../jump.cgi?u=' . b64url_encode($url) . '&amp;s=' . jump_sign($url);
+}
+
+/**
+ * エスケープ済みの本文から URL を探して、リンクにする。
+ *  - URL に使える ASCII の文字と、エスケープされた &amp; &#39; だけを URL とみなす
+ *    (直後の日本語、&gt; &quot; などのエスケープ、<br> は URL に含めない)
+ *  - 末尾の . , ; : ! ? ( と、対応のない ) ] は URL に含めない
+ *  - http:// か https:// で始まり、ホスト名の最初が英数字 (または [ ) のものだけ
+ * $jump (既定は JUMP_ENABLED) が true なら、リンク先は署名つきの中継ページ。表示する文字は元の URL のまま。
+ * false なら直リンク。href はエスケープを戻してから属性用に正しくエスケープし直す (生の & を入れない)。
+ */
+function linkify_urls(string $escaped, ?bool $jump = null): string
+{
+    $jump ??= JUMP_ENABLED;
+    return (string)preg_replace_callback(
+        '/https?:\/\/(?:[A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()]|&amp;|&#39;)+/',
+        static function (array $m) use ($jump): string {
+            $dsp = $m[0];
+            $tail = '';
+            while ($dsp !== '') {
+                if (str_ends_with($dsp, '&amp;') || str_ends_with($dsp, '&#39;')) {
+                    $cut = 5;
+                } else {
+                    $c = $dsp[strlen($dsp) - 1];
+                    if (str_contains('.,;:!?(', $c)) $cut = 1;
+                    elseif ($c === ')' && substr_count($dsp, ')') > substr_count($dsp, '(')) $cut = 1;
+                    elseif ($c === ']' && substr_count($dsp, ']') > substr_count($dsp, '[')) $cut = 1;
+                    else break;
+                }
+                $tail = substr($dsp, -$cut) . $tail;
+                $dsp = substr($dsp, 0, -$cut);
+            }
+            $url = str_replace(['&amp;', '&#39;'], ['&', "'"], $dsp);
+            if (!url_is_valid($url)) return $m[0];
+            $href = $jump ? jump_href($url) : html_escape($url);
+            return '<a href="' . $href . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>' . $tail;
+        },
+        $escaped
+    );
+}
+
+/** レス用フォーム (1行で返す。スレッドファイルのパーサが行単位のため)。鍵つきスレッドは認証キーの欄が付く */
+function reply_form(string $res, string $links = '', bool $locked = false): string
 {
     return '<form method=post action="../amezo.cgi" class="post">'
         . '<input type=hidden name="res" value="' . $res . '">'
         . '<div class="row">投稿者 <input type=text name="name" size=20> '
         . 'メール <input type=text name="mail" size=20 maxlength=50></div>'
+        . ($locked ? '<div class="row">🔒 認証キー <input type=password name="key" size=32 autocomplete=off required>'
+                     . ' このスレッドは認証キーがないと書き込めません</div>' : '')
         . '<textarea name="comm" rows=4 cols=70 maxlength=400></textarea>'
         . '<div class="row"><input type=submit value="↑へのレスカキコ"></div>'
         . $links
         . '</form>';
+}
+
+// =========================================================================
+// 認証キー (鍵つきスレッド): <板>/<スレ番号>.lock があれば、書き込みにキーが要る
+// =========================================================================
+
+function thread_is_locked(string $folder, string $res): bool
+{
+    return is_file("./$folder/$res.lock");
+}
+
+/** スレッドファイルの末尾から [返信フォームの位置, 最後のレス番号, 最後のレス行] を求める (全体は読まない) */
+function thread_footer_info($W): array
+{
+    $size = (int)fstat($W)['size'];
+    if ($size === 0) return [0, 0, ''];
+    $n = min($size, 65536);
+    $off = $size - $n;
+    fseek($W, $off);
+    $tail = (string)fread($W, $n);
+    $p = strrpos($tail, "\n<form");
+    if ($p === false) {                       // 返信フォームが無い (壊れている) ときは末尾に足す
+        $footer = $size;
+        $before = rtrim($tail, "\n");
+    } else {
+        $footer = $off + $p + 1;
+        $before = substr($tail, 0, $p);
+    }
+    $nl = strrpos($before, "\n");
+    $prev = $nl === false ? $before : substr($before, $nl + 1);
+    $cnt = preg_match('/<dt>(\d+)/', $prev, $m) ? (int)$m[1] : 0;
+    return [$footer, $cnt, $prev];
+}
+
+function base32_encode_bytes(string $bin): string
+{
+    $out = '';
+    $bits = 0;
+    $buf = 0;
+    foreach (str_split($bin) as $ch) {
+        $buf = ($buf << 8) | ord($ch);
+        $bits += 8;
+        while ($bits >= 5) {
+            $bits -= 5;
+            $out .= KEY_ALPHABET[($buf >> $bits) & 31];
+        }
+        $buf &= (1 << $bits) - 1;
+    }
+    if ($bits > 0) $out .= KEY_ALPHABET[($buf << (5 - $bits)) & 31];
+    return $out;
+}
+
+/** 入力されたキーを正規の形 (大文字24文字) にそろえる。形が違えば null */
+function key_normalize(string $s): ?string
+{
+    $c = strtoupper((string)preg_replace('/[^A-Za-z2-7]/', '', $s));
+    return strlen($c) === 24 ? $c : null;
+}
+
+function key_display(string $canon): string
+{
+    return implode('-', str_split($canon, 4));
+}
+
+function key_hash(string $canon): string
+{
+    return hash_hmac('sha256', KEY_CTX . $canon, load_secret(KEY_SECRET_FILE));
+}
+
+/** keys.txt の全行 (管理画面用。キーは板ごとに数が少ない前提) */
+function keys_load(string $folder): array
+{
+    $rows = [];
+    $fp = @fopen("./$folder/" . KEYS_FILE, 'r');
+    if (!$fp) return $rows;
+    while (($line = fgets($fp)) !== false) {
+        $p = explode("\t", rtrim($line, "\r\n"));
+        if (count($p) !== 6) continue;
+        $rows[] = ['id' => $p[0], 'label' => $p[1], 'hash' => $p[2], 'scope' => $p[3], 'created' => (int)$p[4], 'status' => $p[5]];
+    }
+    fclose($fp);
+    return $rows;
+}
+
+/** 投稿のときの照合用: ID の行だけを、1行ずつ読んで探す */
+function key_find_row(string $folder, string $id): ?array
+{
+    $fp = @fopen("./$folder/" . KEYS_FILE, 'r');
+    if (!$fp) return null;
+    $found = null;
+    while (($line = fgets($fp)) !== false) {
+        if (!str_starts_with($line, $id . "\t")) continue;
+        $p = explode("\t", rtrim($line, "\r\n"));
+        if (count($p) === 6) {
+            $found = ['id' => $p[0], 'label' => $p[1], 'hash' => $p[2], 'scope' => $p[3], 'created' => (int)$p[4], 'status' => $p[5]];
+            break;
+        }
+    }
+    fclose($fp);
+    return $found;
+}
+
+/** キーがこのスレッドに書き込めるか。失効・範囲外・存在しない・形が違う、はどれも false (区別しない) */
+function key_verify(string $folder, string $res, string $input): bool
+{
+    $canon = key_normalize($input);
+    if ($canon === null) return false;
+    $row = key_find_row($folder, substr($canon, 0, 4));
+    if ($row === null || $row['status'] !== 'active') return false;
+    if (!hash_equals($row['hash'], key_hash($canon))) return false;
+    return $row['scope'] === '*' || $row['scope'] === $res;
+}
+
+/** keys.txt を排他ロックして、$fn(全行) の結果で書き直す (一時ファイル + rename)。失敗したら false */
+function keys_update(string $folder, callable $fn): bool
+{
+    $lk = @fopen("./$folder/keys.lock", 'c');
+    if (!$lk) return false;
+    flock($lk, LOCK_EX);
+    $rows = $fn(keys_load($folder));
+    $path = "./$folder/" . KEYS_FILE;
+    $tmp = $path . '.tmp' . getmypid();
+    $old = umask(0077);
+    $W = @fopen($tmp, 'w');
+    umask($old);
+    $ok = false;
+    if ($W) {
+        foreach ($rows as $r) {
+            fwrite($W, implode("\t", [$r['id'], $r['label'], $r['hash'], $r['scope'], $r['created'], $r['status']]) . "\n");
+        }
+        fclose($W);
+        $ok = @rename($tmp, $path);
+        if (!$ok) @unlink($tmp);
+    }
+    flock($lk, LOCK_UN);
+    fclose($lk);
+    return $ok;
+}
+
+/** 管理者がキーを発行する。戻り値: 表示用のキー (この1回しか見られない)。保存できなければ null */
+function key_issue(string $folder, string $label, string $scope): ?string
+{
+    $label = trim((string)preg_replace('/[\x00-\x1f\x7f]/u', ' ', $label));
+    $label = mb_substr($label, 0, 40, 'UTF-8');
+    if ($label === '') $label = '(無題)';
+    if ($scope !== '*' && !preg_match('/^\d{1,20}$/', $scope)) return null;
+
+    $display = null;
+    $ok = keys_update($folder, static function (array $rows) use ($label, $scope, &$display): array {
+        $used = array_column($rows, 'id');
+        do {
+            $canon = base32_encode_bytes(random_bytes(15));      // 120bit = 24文字。先頭4文字が ID
+            $id = substr($canon, 0, 4);
+        } while (in_array($id, $used, true));
+        $rows[] = ['id' => $id, 'label' => $label, 'hash' => key_hash($canon), 'scope' => $scope,
+                   'created' => time(), 'status' => 'active'];
+        $display = key_display($canon);
+        return $rows;
+    });
+    return $ok ? $display : null;
+}
+
+function key_revoke(string $folder, string $id): bool
+{
+    $hit = false;
+    $ok = keys_update($folder, static function (array $rows) use ($id, &$hit): array {
+        foreach ($rows as &$r) {
+            if ($r['id'] === $id && $r['status'] === 'active') { $r['status'] = 'revoked'; $hit = true; }
+        }
+        return $rows;
+    });
+    return $ok && $hit;
+}
+
+/**
+ * スレッドに鍵をかける/外す。返信フォームの行を差し替え、印 (.lock) を作る/消す。
+ * 投稿側も同じスレッドのロックの中で .lock を確認するので、フォームと実際の状態がずれない。
+ * @return array{0: bool, 1: string}
+ */
+function thread_set_lock(string $folder, string $res, bool $lock): array
+{
+    $path = "./$folder/$res.html";
+    if (!is_file($path)) return [false, 'スレッドがありません。'];
+    $W = @fopen($path, 'r+');
+    if (!$W) return [false, 'スレッドを開けません。'];
+    flock($W, LOCK_EX);
+    [$footer] = thread_footer_info($W);
+    $new = reply_form($res, '', $lock) . "</body></html>\n";
+    fseek($W, $footer);
+    fwrite($W, $new);
+    fflush($W);
+    ftruncate($W, $footer + strlen($new));
+    $lockfile = "./$folder/$res.lock";
+    $ok = $lock ? (@file_put_contents($lockfile, '') !== false) : (!file_exists($lockfile) || @unlink($lockfile));
+    fclose($W);
+    if (!$ok) return [false, '鍵の印のファイルを更新できませんでした。'];
+    return [true, $lock ? "スレッド {$res} に鍵をかけました。" : "スレッド {$res} の鍵を外しました。"];
 }
 
 // =========================================================================
@@ -383,18 +663,19 @@ function res_view(string $folder, array $form): never
 
     header('Content-Type: text/html; charset=UTF-8');
     while (($line = fgets($fp)) !== false) {
-        echo str_replace(['href="../style.css"', 'src="../hide.js"'], ['href="style.css"', 'src="hide.js"'], $line);
+        echo str_replace(['href="../style.css"', 'src="../hide.js"', 'href="../jump.cgi?'], ['href="style.css"', 'src="hide.js"', 'href="jump.cgi?'], $line);
         if (str_contains($line, '<dl>') || str_contains($line, '<dt>')) break;
     }
     $fol_tag = '<input type="hidden" name="folder" value="' . htmlspecialchars($folder, ENT_QUOTES, 'UTF-8') . '">';
     // 返信フォームの行は、action を板のない位置に直し、folder を足して出す
     $form_line = static fn(string $l): string => str_replace('</form>', $fol_tag . '</form>', str_replace('action="../', 'action="', $l));
+    $fixj = static fn(string $l): string => str_contains($l, '../jump.cgi?') ? str_replace('href="../jump.cgi?', 'href="jump.cgi?', $l) : $l;   // / 直下から出力するので、中継リンクの相対パスを直す
     $matched = false;
     $footer = null;
     while (($line = fgets($fp)) !== false) {
         if (str_starts_with($line, '<form')) $footer = $line;
         if (preg_match('/<dt>(\d+)/', $line, $m) && (int)$m[1] >= $from) {
-            echo $line;
+            echo $fixj($line);
             $matched = true;
             break;
         }
@@ -403,7 +684,7 @@ function res_view(string $folder, array $form): never
         echo $form_line($footer);
     }
     while (($line = fgets($fp)) !== false) {
-        echo str_contains($line, '</form>') ? $form_line($line) : $line;
+        echo str_contains($line, '</form>') ? $form_line($line) : $fixj($line);
     }
     fclose($fp);
     exit;
@@ -688,6 +969,7 @@ function regen_index(string $folder, int $page = 1, bool $reload = false, bool $
             foreach (array_slice($files, MAX_THREADS) as [$ts, $f]) {
                 if (!file_exists("./$folder/o$f") && @rename("./$folder/$f", "./$folder/o$f")) {
                     $retired_now[] = [$ts, "o$f"];
+                    @unlink('./' . $folder . '/' . substr($f, 0, -5) . '.lock');     // 過去ログは書き込めないので、鍵の印は要らない
                 }
             }
         }
@@ -762,7 +1044,7 @@ function regen_index(string $folder, int $page = 1, bool $reload = false, bool $
         }
         $links = "<div class=\"row links\"><a href=\"{$res_id}.html\">レス全部を見る</a> "
             . "{$sub_tag}<a href=\"#top\">上へ</a> <a href=\"./\">リロード</a></div>";
-        fwrite($W, '</font></td></tr></table>' . "\n" . reply_form($res_id, $links) . "<hr>\n");
+        fwrite($W, '</font></td></tr></table>' . "\n" . reply_form($res_id, $links, thread_is_locked($folder, $res_id)) . "<hr>\n");
     }
 
     fwrite($W, $pager . "<hr></body></html>\n");

@@ -5,14 +5,21 @@
 //
 //   PHP_CLI_SERVER_WORKERS=2 php -S 127.0.0.1:8000 router.php
 //
-$path = rawurldecode(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/');
-if (str_contains($path, "\0") || str_contains($path, '..') || str_contains($path, '\\')) {
+// REQUEST_URI の「?」より前を、そのまま使う。parse_url() は使わない。
+// parse_url('//shell.php') は「ホスト名 shell.php」と読んでパスを null にするので、router は '/' (許可リスト内) と判断して
+// return false するのに、サーバーは生の '//shell.php' を実際のファイルとして開き、PHP なら実行してしまう。
+// router が判定するパスと、サーバーが開くパスを同じにする: '//'、'%' (パーセントエンコード)、'\'、'.' '..' の区間、NUL、
+// '/' で始まらない形 (http://… の絶対形式) は、すべて 400 で止める。本来の経路 (板・スレッド・jump.cgi) はどれも使わない形。
+$path = (string)($_SERVER['REQUEST_URI'] ?? '/');
+if (($q = strpos($path, '?')) !== false) $path = substr($path, 0, $q);
+if ($path === '' || $path[0] !== '/' || str_contains($path, '//') || str_contains($path, '%') || str_contains($path, '\\')
+    || str_contains($path, "\0") || str_contains($path, '..') || preg_match('~(?:^|/)\.(?:/|$)~', $path)) {
     http_response_code(400);
     return true;
 }
 
 // ---- CGI 相当 (amezo.cgi / amezo.php など) ----------------------------------
-if (preg_match('~^/(amezo|dai|admin)\.(?:cgi|php)$~', $path, $m)) {
+if (preg_match('~^/(amezo|dai|admin|jump)\.(?:cgi|php)$~', $path, $m)) {
     $f = __DIR__ . "/{$m[1]}.php";
     if (is_file($f)) {
         require $f;
@@ -24,7 +31,7 @@ if (preg_match('~^/(amezo|dai|admin)\.(?:cgi|php)$~', $path, $m)) {
 }
 
 // ---- 静的ファイル (許可リスト) -------------------------------------------------
-if (in_array($path, ['/', '/index.html', '/style.css', '/hide.js'], true)) {
+if (in_array($path, ['/', '/index.html', '/style.css', '/hide.js', '/ad.html'], true)) {
     return false;
 }
 
