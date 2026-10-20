@@ -22,6 +22,8 @@ CODE = '<?php echo "EXEC-RESULT:" . (1+1); ?>\n'      # 実行されると "EXEC
 plant = [f'{PH}/probe_root.php', f'{PH}/probe_root.phtml', f'{PH}/adm/shell.php', f'{PH}/adm/shell.phtml', f'{PH}/adm/shell.php5',
          f'{PH}/adm/shell.phar', f'{PH}/adm/.htaccess', f'{PH}/adm/999999999999.html', f'{PH}/adm/index99.html', f'{PH}/adm/o111.html']
 for p in plant: open(p, 'w').write(CODE)
+SECRET = f'{PH}/probe_secret.txt'; MARK = 'SECRET-MARKER-9'
+open(SECRET, 'w').write(MARK + '\n')      # アプリのフォルダ直下の秘密ファイル (delpass.txt や *_secret.txt の代わり)
 try:
     # --- 1. 実行されてはいけない経路 (404 か 400 で、実行結果が出ない) ---
     deny = ['/probe_root.php', '//probe_root.php', '///probe_root.php', '//./probe_root.php', '//probe_root.php?x=1', '//probe_root.phtml',
@@ -29,11 +31,13 @@ try:
             '/adm/shell.php', '/adm/shell.phtml', '/adm/shell.php5', '/adm/shell.phar', '/adm/.htaccess', '/adm//shell.php', '//adm/shell.php',
             '/amezo.cgi/probe_root.php', '/amezo.php/x', '/adm/shell.php/amezo.cgi', '/./probe_root.php', '\\probe_root.php',
             '//lib.php', '//router.php', '//config.php', '//admin.php/x', '/lib.php', '/config.php', '/tests/unit.php', '/jump_secret.txt', '/adm/keys.txt',
-            'http://127.0.0.1:8123/probe_root.php', 'http://127.0.0.1:8123//probe_root.php']
+            'http://127.0.0.1:8123/probe_root.php', 'http://127.0.0.1:8123//probe_root.php',
+            '/probe_secret.txt', '//probe_secret.txt', '///probe_secret.txt', '//probe_secret.txt?x=1', 'http://127.0.0.1:8123//probe_secret.txt',
+            '//delpass.txt', '//trip_secret.txt', '//id_secret.txt', '//key_secret.txt', '//jump_secret.txt', '//cap.txt', '//ng.txt', '//blist.txt']
     for t in deny:
         c, b = raw(t)
         allowed = (400, 404) + ((0,) if t.startswith('\\') else ())     # '\\' で始まるのは HTTP として不正。サーバーが接続を切ってもよい (実行されなければよい)
-        ok(f'実行されない: {t}', 'EXEC-RESULT:2' not in b and c in allowed, f'HTTP {c}')
+        ok(f'実行・配信されない: {t}', 'EXEC-RESULT:2' not in b and MARK not in b and c in allowed, f'HTTP {c}')
     # --- 2. 許可リストの静的ファイルは、中身が PHP でも文字のまま返る (実行されない) ---
     for t in ['/adm/999999999999.html', '/adm/index99.html', '/adm/o111.html']:
         c, b = raw(t)
@@ -45,7 +49,7 @@ try:
         c, b = raw(t)
         ok(f'通常の経路: {t}', c == want, f'HTTP {c}')
 finally:
-    for p in plant:
+    for p in plant + [SECRET]:
         try: os.unlink(p)
         except OSError: pass
 print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
