@@ -1,0 +1,130 @@
+From 778a3f905010ea89bb0bac752f1e682b861eb8e9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 10:00:06 +0000
+Subject: [PATCH] =?UTF-8?q?hide.js:=20localStorage=20=E3=81=AB=E6=83=B3?=
+ =?UTF-8?q?=E5=AE=9A=E5=A4=96=E3=81=AE=E5=80=A4=20(null=20=E3=81=AA?=
+ =?UTF-8?q?=E3=81=A9)=20=E3=81=8C=E5=85=A5=E3=81=A3=E3=81=A6=E3=81=84?=
+ =?UTF-8?q?=E3=81=A6=E3=82=82=E5=8B=95=E3=81=8F=E3=82=88=E3=81=86=E3=81=AB?=
+ =?UTF-8?q?=E3=81=99=E3=82=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- JSON.parse('null') は null を返し、そのまま H に入れると H['id:…'] で例外になり、ボタンの文字も出ず、隠す操作も効かない
+  (保存の前に失敗するので、値が残り続け、サイトのデータを消すまで直らない)
+- 配列・数値・文字列・true が入っていると、エラーは出ないまま、隠す操作が効かない・保存されない
+- 時刻が文字列などの値は、期限なしで「隠れ続ける」状態になっていた (NaN の比較は常に false)
+
+修正: 読み込んだ値のうち、キーが id: / trip: で始まり、値が正の有限の数のものだけを受け入れる。
+それ以外 (null・配列・プリミティブ・__proto__・constructor などのキー・数値でない時刻) は捨てる。件数は5000までにする。
+tests/hide_test.js (Node + jsdom) を追加: 壊れた値18種、正しい値、期限、巨大な値、localStorage が使えない場合 (28項目)。
+修正前は11件失敗する。
+---
+ hide.js            | 16 +++++++++--
+ tests/hide_test.js | 66 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 80 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hide_test.js
+
+diff --git a/hide.js b/hide.js
+index c362ba7..5926f94 100644
+--- a/hide.js
++++ b/hide.js
+@@ -1,9 +1,21 @@
+ // hide.js - ID / トリップの非表示 (ブラウザの localStorage だけで動く。サーバーは何もしない)
+ (() => {
+   const K = 'bbs_hide', TTL = 3 * 864e5, now = Date.now();
++  // 保存されているのは {"id:…": 時刻, "trip:…": 時刻} というオブジェクトだけ。それ以外 (null・配列・数値・文字列・true・壊れた JSON、
++  // 他のスクリプトや古い版が書いた値) が入っていても、捨てて空から始める。JSON.parse('null') は null を返すので、
++  // そのまま H に入れると H['id:…'] で例外になり、全体が動かなくなる。配列や数値だと、エラーは出ないまま、隠せず・保存もされない。
+   let H = {};
+-  try { H = JSON.parse(localStorage.getItem(K) || '{}'); } catch { H = {}; }
+-  for (const k in H) if (k.startsWith('id:') && now - H[k] > TTL) delete H[k];   // ID は日替わりなので3日で捨てる
++  try {
++    const o = JSON.parse(localStorage.getItem(K) || '{}');
++    if (o !== null && typeof o === 'object' && !Array.isArray(o)) {
++      for (const k of Object.keys(o).slice(0, 5000)) {                       // 件数の上限 (巨大な値で重くならないように)
++        const t = o[k];
++        if (!/^(id|trip):/.test(k) || typeof t !== 'number' || !Number.isFinite(t) || t <= 0) continue;   // __proto__ などの変なキー・時刻でない値は捨てる
++        if (k.startsWith('id:') && now - t > TTL) continue;                  // ID は日替わりなので3日で捨てる
++        H[k] = t;
++      }
++    }
++  } catch { H = {}; }
+   const save = () => { try { localStorage.setItem(K, JSON.stringify(H)); } catch {} };
+ 
+   const metas = [...document.querySelectorAll('.meta[data-id]')];
+diff --git a/tests/hide_test.js b/tests/hide_test.js
+new file mode 100644
+index 0000000..c751009
+--- /dev/null
++++ b/tests/hide_test.js
+@@ -0,0 +1,66 @@
++// hide.js の確認 (Node + jsdom): localStorage に、想定外の値 (null・配列・数値・壊れた JSON など) が入っていても、
++// 例外を出さず、ボタンの文字が出て、隠す操作が効き、保存される。
++//   使い方: npm i jsdom && node tests/hide_test.js [hide.js のパス]
++const {JSDOM} = require('jsdom'); const fs = require('fs'); const path = require('path');
++const file = process.argv[2] || path.join(__dirname, '..', 'hide.js');
++const code = fs.readFileSync(file, 'utf8');
++const post = (n, id, trip) => `<dl><dt>${n}投稿者：<font color=forestgreen><b>n${n} </b></font><font size=-1 class="meta" data-id="${id}"${trip ? ` data-trip="${trip}"` : ''}>　投稿日：d ID:${id}</font><br><dd>c${n} </dl>`;
++const HTML = `<html><body>${post(1, 'idA1', 'tripX')}${post(2, 'idB2', '')}${post(3, 'idA1', 'tripX')}</body></html>`;   // idA1 と tripX は、1番と3番が同じ
++const now = Date.now(), DAY = 864e5;
++let bad = 0, n = 0;
++function ok(label, cond, extra = '') { n++; if (!cond) bad++; console.log((cond ? 'OK   ' : 'NG   ') + label + (extra ? '  ' + extra : '')); }
++
++function run(stored, {before} = {}) {
++  const dom = new JSDOM(HTML, {runScripts: 'outside-only', url: 'http://localhost/'});
++  const w = dom.window, errs = [];
++  w.addEventListener('error', e => errs.push(e.message));
++  if (before) before(w);
++  if (stored !== undefined && !before) w.localStorage.setItem('bbs_hide', stored);
++  try { w.eval(code); } catch (e) { errs.push(String(e.message)); }
++  const d = w.document;
++  const btns = [...d.querySelectorAll('a[data-hide]')];
++  const r = {errs, buttons: btns.length, labeled: btns.length > 0 && btns.every(a => a.textContent.length > 0), hiddenAtLoad: d.querySelectorAll('dl.abone').length};
++  const first = d.querySelector('a[data-hide^="id:"]');
++  if (first) first.dispatchEvent(new w.MouseEvent('click', {bubbles: true, cancelable: true}));
++  r.errs = errs; r.hiddenAfterClick = d.querySelectorAll('dl.abone').length;
++  try { r.saved = JSON.parse(w.localStorage.getItem('bbs_hide')); } catch { r.saved = undefined; }
++  r.w = w; return r;
++}
++const isObj = o => o !== null && typeof o === 'object' && !Array.isArray(o);
++
++// --- 壊れた・想定外の値: 例外なし / 文字が出る / 隠せる / 保存される (保存された値は、正しい形のオブジェクト) ---
++const weird = [['(未設定)', undefined], ['"null" (setItem(k, null))', 'null'], ['"[]"', '[]'], ['"[1,2]"', '[1,2]'], ['"123"', '123'], ['"\\"str\\""', '"str"'],
++               ['"true"', 'true'], ['"false"', 'false'], ['"{}"', '{}'], ['"{bad" (壊れた JSON)', '{bad'], ['"" (空文字)', ''], ['"undefined"', 'undefined'], ['"NaN"', 'NaN'],
++               ['{"id:idA1":"x"} (時刻が文字列)', '{"id:idA1":"x"}'], ['{"id:idA1":null}', '{"id:idA1":null}'], ['{"id:idA1":-5}', '{"id:idA1":-5}'],
++               ['{"id:idA1":{}} (時刻がオブジェクト)', '{"id:idA1":{}}'], ['{"foo":1} (知らないキー)', '{"foo":1}']];
++for (const [label, v] of weird) {
++  const r = run(v);
++  ok(`${label}: 例外なし・文字が出る・隠せる・正しい形で保存`, r.errs.length === 0 && r.labeled && r.hiddenAtLoad === 0 && r.hiddenAfterClick >= 1 && isObj(r.saved) && typeof r.saved['id:idA1'] === 'number',
++     r.errs[0] ? r.errs[0].slice(0, 50) : `読込時の隠れ ${r.hiddenAtLoad}, クリック後 ${r.hiddenAfterClick}, 保存 ${JSON.stringify(r.saved)}`);
++}
++// --- 正しい値: 従来どおり ---
++let r = run(JSON.stringify({'id:idA1': now}));
++ok('正しい: ID を隠していた → 読み込み時に隠れている (同じ ID の2件)。ボタンで解除できる', r.hiddenAtLoad === 2 && r.hiddenAfterClick === 0 && r.errs.length === 0 && !('id:idA1' in r.saved));
++r = run(JSON.stringify({'trip:tripX': now}));
++ok('正しい: トリップを隠していた → 読み込み時に隠れている (同じトリップの2件)', r.hiddenAtLoad === 2 && r.errs.length === 0);
++r = run(JSON.stringify({'id:idA1': now - 4 * DAY}));
++ok('ID は3日たつと捨てる', r.hiddenAtLoad === 0 && r.errs.length === 0);
++r = run(JSON.stringify({'trip:tripX': now - 400 * DAY}));
++ok('トリップは期限なし (400日前でも残る)', r.hiddenAtLoad === 2);
++r = run(JSON.stringify({'id:idA1': now - 4 * DAY, 'trip:tripX': now - 400 * DAY}));
++ok('期限切れの ID は捨て、トリップは残る (ID で隠すと保存し直され、トリップはそのまま保存される)', r.hiddenAtLoad === 2 && r.saved && 'trip:tripX' in r.saved && typeof r.saved['id:idA1'] === 'number' && r.saved['id:idA1'] > now - DAY);
++// --- 変なキー・巨大な値 ---
++r = run('{"__proto__":{"polluted":1},"id:idA1":' + now + '}');
++ok('__proto__ を含む値でも、Object.prototype を汚さない', ({}).polluted === undefined && r.errs.length === 0 && r.hiddenAtLoad === 2, String(({}).polluted));
++r = run(JSON.stringify({'constructor': now, 'toString': now, 'id:': now, 'hasOwnProperty': now}));
++const own = k => Object.prototype.hasOwnProperty.call(r.saved || {}, k);
++ok('constructor / toString / hasOwnProperty などのキーは捨てる (自分で持つキーとして保存しない)', r.errs.length === 0 && r.hiddenAtLoad === 0 && !own('constructor') && !own('toString') && !own('hasOwnProperty'));
++const big = {}; for (let i = 0; i < 6000; i++) big['id:k' + i] = now;
++const t0 = Date.now(); r = run(JSON.stringify(big));
++ok('6000件の巨大な値でも、上限 (5000件) で止まり、重くならない', r.errs.length === 0 && Object.keys(r.saved || {}).length <= 5001 && Date.now() - t0 < 3000, `保存 ${Object.keys(r.saved || {}).length}件, ${Date.now() - t0}ms`);
++// --- localStorage 自体が使えない (ブラウザの設定・プライベートモードなど) ---
++r = run(undefined, {before: w => Object.defineProperty(w, 'localStorage', {get() { throw new w.Error('SecurityError'); }})});
++ok('localStorage に触るだけで例外 (使えない設定): 例外なし・文字が出る・その場では隠せる', r.errs.length === 0 && r.labeled && r.hiddenAfterClick >= 1, r.errs[0] || '');
++r = run(undefined, {before: w => { w.Storage.prototype.setItem = function () { throw new w.Error('QuotaExceededError'); }; }});
++ok('保存だけが失敗 (容量いっぱい): 例外なし・その場では隠せる', r.errs.length === 0 && r.labeled && r.hiddenAfterClick >= 1, r.errs[0] || '');
++console.log(`\n${n} 項目, NG ${bad} 件 (${path.basename(path.dirname(file))}/${path.basename(file)})`); process.exit(bad ? 1 : 0);
+-- 
+2.43.0
+

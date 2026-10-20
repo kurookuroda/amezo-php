@@ -15,6 +15,8 @@
 #     !python3 setup_expose.py                         # 起動 (Ctrl+C / セルの停止で止まる)
 #   ローカルで試すだけ (トンネルなし):
 #     python3 setup_expose.py --no-tunnel
+#   PHP は既定で「実行系の関数を無効にし、ファイルアクセスをアプリのフォルダ (と一時フォルダ) に閉じ込めて」起動する
+#   (万一、PHP のコードを実行されても、コマンド実行・外への接続・アプリの外のファイル操作ができないようにする)。--no-harden で無効にできる。
 #   メモリを節約したいとき (起動後に、このランチャー自身は終了して、PHP とトンネルだけを残す):
 #     !python3 setup_expose.py --detach        # 止めるとき: !pkill -x php; pkill -x cloudflared
 
@@ -111,37 +113,76 @@ def ensure_php():
 
 REQUIRED_FUNCS = ["ctype_digit", "ctype_xdigit", "filter_var", "inet_pton", "hash_hmac", "hash_pbkdf2", "hash_equals",
                   "random_bytes", "mb_check_encoding", "mb_convert_encoding", "mb_scrub", "mb_chr", "mb_ord", "mb_substr",
-                  "preg_match_all", "flock", "stream_copy_to_stream", "tmpfile"]
+                  "preg_match_all", "flock", "stream_copy_to_stream", "tmpfile", "parse_ini_file", "base64_encode", "parse_url"]
+
+# コードを実行できた攻撃者に使わせない関数。アプリ本体はどれも使っていない (走査で確認)。
+# setup_expose.py が PHP を起動するのは Python の subprocess なので、ここで無効にしても影響しない。
+DISABLED_FUNCS = ["exec", "passthru", "shell_exec", "system", "proc_open", "popen", "pcntl_exec", "dl", "mail", "show_source",
+                  "highlight_file", "phpinfo", "posix_kill", "posix_setuid", "posix_setgid", "posix_mkfifo", "symlink", "link",
+                  "putenv", "fsockopen", "pfsockopen", "stream_socket_client", "stream_socket_server", "stream_socket_pair",
+                  "socket_create", "socket_create_listen", "curl_exec", "curl_multi_exec", "proc_nice", "proc_terminate",
+                  "proc_get_status"]
+
+# アプリのフォルダで lib.php を読み込み、必要な関数が揃っていて動くかを確かめる (何も書かない)
+SELF_TEST = ("foreach (" + "[" + ",".join(f'"{f}"' for f in REQUIRED_FUNCS) + "] as $f) if (!function_exists($f)) { echo $f; exit(1); } "
+             'require "lib.php"; echo (linkify_urls("https://a.com/x", false) !== "" && mb_strlen("あ") === 1 && ctype_digit("1")) ? "OK" : "NG";')
 
 
-def php_runtime_args(trim=True):
-    """
-    php に渡す起動引数。
-    trim=True のときは php.ini を読まず (-n)、必要な拡張 (mbstring, ctype) だけを読み込む。
-    余計な拡張 (約20個) を読み込まないぶん、常駐メモリが 5MB ほど減る。
-    必要な関数が1つでも欠けるときは、安全のため通常の起動 (空の引数) に戻す。
-    """
-    limit = ["-d", "memory_limit=32M"]       # 想定外の入力でメモリを使い切らないための上限 (5MBのスレッドでも 3MB で足りる)
-    if not trim:
-        return limit
+def run_php(args, cwd=None):
     try:
-        ext_dir = subprocess.run(["php", "-r", 'echo ini_get("extension_dir");'], capture_output=True, text=True, timeout=15).stdout.strip()
+        r = subprocess.run(["php", *args], capture_output=True, text=True, timeout=20, cwd=cwd)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
     except (OSError, subprocess.SubprocessError):
-        return limit
+        return -1, "", ""
+
+
+def trim_args():
+    """php.ini を読まず (-n)、必要な拡張 (mbstring, ctype) だけを読み込む。余計な拡張を読み込まないぶん、常駐メモリが 5MB ほど減る"""
+    rc, ext_dir, _ = run_php(["-r", 'echo ini_get("extension_dir");'])
     args = ["-n"]
     for ext in ("mbstring", "ctype"):
         so = os.path.join(ext_dir, ext + ".so")
         if os.path.exists(so):
             args += ["-d", f"extension={so}"]
-    check = "foreach (" + "[" + ",".join(f'"{f}"' for f in REQUIRED_FUNCS) + "] as $f) if (!function_exists($f)) { echo $f; exit(1); }"
-    try:
-        r = subprocess.run(["php", *args, "-r", check], capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return limit
-    if r.returncode != 0:
-        print(f"  ℹ️ 拡張を絞った起動は使えません ({r.stdout.strip() or '確認に失敗'} が無い)。通常の起動にします。")
-        return limit
-    return args + limit
+    return args
+
+
+def harden_args():
+    """実行系の関数を無効にし、ファイルアクセスをアプリのフォルダと一時フォルダに閉じ込め、URL の読み込みを禁止する"""
+    rc, tmp, _ = run_php(["-r", "echo sys_get_temp_dir();"])
+    dirs = []
+    for d in (BASE_DIR, tmp or "/tmp"):                  # 一時フォルダは TMPDIR で変わる。tmpfile() が使えるように含める
+        d = os.path.realpath(d).rstrip("/") + "/"
+        if d not in dirs:
+            dirs.append(d)
+    return ["-d", "expose_php=0", "-d", "allow_url_fopen=0", "-d", "allow_url_include=0",
+            "-d", "open_basedir=" + ":".join(dirs), "-d", "disable_functions=" + ",".join(DISABLED_FUNCS)]
+
+
+def php_runtime_args(trim=True, harden=True):
+    """
+    php に渡す起動引数と、実際に使えた設定 {'trim': bool, 'harden': bool} を返す。
+    候補を、(絞る + 制限) → (制限だけ) → (絞るだけ) → (どちらもなし) の順に、実際に lib.php を読み込む自己テストで確かめて、
+    最初に動いたものを使う。セキュリティの制限を、メモリの節約よりも優先して残す。
+    """
+    limit = ["-d", "memory_limit=32M"]                   # 想定外の入力でメモリを使い切らないための上限
+    t = trim_args() if trim else []
+    h = harden_args() if harden else []
+    candidates = [(t, h)]
+    if h and t: candidates.append(([], h))
+    if t: candidates.append((t, []))
+    if h or t: candidates.append(([], []))
+    for ta, ha in candidates:
+        args = ta + ha + limit
+        rc, out, err = run_php([*args, "-r", SELF_TEST], cwd=BASE_DIR)
+        if rc == 0 and out.endswith("OK"):
+            if (trim and not ta) or (harden and not ha):
+                dropped = ("拡張の絞り込み" if trim and not ta else "") + (" と " if (trim and not ta) and (harden and not ha) else "") + ("実行系の制限" if harden and not ha else "")
+                print(f"  ℹ️ {dropped}を外して起動します。")
+            return args, {"trim": bool(ta), "harden": bool(ha)}
+        reason = (out or err or "確認に失敗").splitlines()[0][:100]
+        print(f"  ℹ️ 候補 (絞る={'はい' if ta else 'いいえ'}, 制限={'はい' if ha else 'いいえ'}) は使えません: {reason}")
+    return limit, {"trim": False, "harden": False}
 
 
 # ---- 事前チェックと準備 -------------------------------------------------------
@@ -218,9 +259,9 @@ def cleanup_old_processes(port):
 
 # ---- Web サーバー (php -S) ------------------------------------------------------
 
-def start_php_server(port, workers, verbose=False, detach=False, trim=True):
-    runtime = php_runtime_args(trim)
-    note = "拡張を絞って" if "-n" in runtime else "通常の設定で"
+def start_php_server(port, workers, verbose=False, detach=False, trim=True, harden=True):
+    runtime, info = php_runtime_args(trim, harden)
+    note = ("拡張を絞り、" if info["trim"] else "通常の拡張で、") + ("実行系を制限して" if info["harden"] else "制限なしで")
     print(f"🚀 PHP Webサーバーを起動しています ({note}、ポート {port}, ワーカー {workers})...")
     env = dict(os.environ, PHP_CLI_SERVER_WORKERS=str(workers))
     cmd = ["php", *runtime, "-S", f"127.0.0.1:{port}", "router.php"]
@@ -267,9 +308,9 @@ def self_check(port):
     """起動直後の確認: 板一覧は出る / 鍵やパスワードや PHP のソースは配られない"""
     print("🔎 起動チェック:")
     good = True
-    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
+    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200), ("//lib.php", 400), ("/lib.php", 404),
                        ("/trip_secret.txt", 404), ("/id_secret.txt", 404), ("/delpass.txt", 404),
-                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404),
+                       ("/cap.txt", 404), ("/blist.txt", 404), ("/config.ini", 404),
                        ("/key_secret.txt", 404), ("/jump_secret.txt", 404)]:
         got = http_status(port, path)
         mark = "✅" if got == want else "❌"
@@ -360,6 +401,7 @@ def main():
     ap.add_argument("--detach", action="store_true",
                     help="起動できたらランチャーは終了し、PHP とトンネルだけを残す (メモリ節約。ログは php.log / cloudflared.log)")
     ap.add_argument("--no-trim", action="store_true", help="PHP の拡張を絞らず、通常の設定で起動する")
+    ap.add_argument("--no-harden", action="store_true", help="PHP の実行系の関数・ファイルアクセスの制限をかけずに起動する (動かないときの切り分け用)")
     args = ap.parse_args()
 
     # __file__ が無い環境 (Jupyter/Colab) では os.getcwd() を使う
@@ -377,7 +419,7 @@ def main():
     cleanup_old_processes(args.port)
     setup_bbs_directories()
 
-    php_proc = start_php_server(args.port, args.workers, args.verbose, args.detach, not args.no_trim)
+    php_proc = start_php_server(args.port, args.workers, args.verbose, args.detach, not args.no_trim, not args.no_harden)
     tunnel_proc = None
     keep_running = False
 

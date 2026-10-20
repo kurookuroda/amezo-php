@@ -9,3 +9,4 @@ key_secret.txt
 keys.txt
 *.lock
 jump_secret.txt
+config.ini

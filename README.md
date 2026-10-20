@@ -14,6 +14,7 @@ Python 版 (`amezo.py` / `dai.py`) の PHP 移植。スレッドは今までど�
 | `router.php` | `php -S` 用。許可リスト方式で静的ファイルを配る |
 | `hide.js` | ID / トリップの非表示 (ブラウザの localStorage だけで動く) |
 | `setup_expose.py` | Colab 用の起動スクリプト (PHP の導入、板フォルダ作成、`php -S`、Cloudflare Tunnel での公開) |
+| `config.sample.ini` | 設定の見本。`config.ini` にコピーして、変えたい行だけ有効にする (実行されない形式) |
 | `run.sh` | ローカル用 (板フォルダを作って `php -S` を起動。`PORT` `WORKERS` で変更可) |
 | `tests/` | Python 版との突き合わせ、結合テスト、メモリ測定 |
 
@@ -80,7 +81,7 @@ webshell = 攻撃者が置いた(または書き込ませた) PHP を、あと�
   いまは `parse_url` を使わず、`//`、`%`、`\`、`.` `..` の区間、NUL、`/` で始まらない形 (`http://…`) を 400 で止める。本来の経路は、どれもこれらを使わない。
   `tests/webshell_test.py` が、この種の経路 (50通り) を毎回確かめる。
 
-**3. 実行されても被害を小さくする (PHP の起動オプション)**
+**3. 実行されても被害を小さくする (PHP の起動オプション。`setup_expose.py` が既定で付ける)**
 `php -S` の起動に、次を付けても、アプリの全テストが通ることを確認した。コードを実行できた攻撃者が、コマンド実行・外への接続・アプリの外のファイルの読み書きをできなくなる。
 
 ```
@@ -92,20 +93,27 @@ stream_socket_server,stream_socket_pair,socket_create,socket_create_listen,curl_
     -S 127.0.0.1:8000 router.php
 ```
 
-(`setup_expose.py` の既定にはまだ入れていない。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、`disable_functions` の影響は受けない。)
+`setup_expose.py` は、この制限と、拡張の絞り込み (`-n` + mbstring/ctype) を **既定で付けて** `php -S` を起動する。
+起動前に、アプリのフォルダで `lib.php` を読み込む自己テストを、候補ごとに実行し、動く最初のものを使う (絞る + 制限 → 制限だけ → 絞るだけ → なし の順。セキュリティの制限を、メモリの節約より優先して残す)。
+一時フォルダは `TMPDIR` で変わるので、PHP に聞いた場所を `open_basedir` に含める (含めないと `tmpfile()` が使えず、管理画面の削除が壊れる)。
+`--no-harden` で制限なし、`--no-trim` で拡張を絞らない起動にできる (動かないときの切り分け用)。`run.sh` で起動するときは、上のオプションを自分で付ける。
+`disable_functions` は、PHP の中から呼ぶ関数だけを無効にする。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、影響を受けない。
 
 **4. 見つける・気づく**
 - 板フォルダに置かれるファイル名は決まっている (`数字.html`、`x数字.html`、`o数字.html`、`数字.lock`、`index数字.html`、`kako.html`、`kako.txt`、`keys.txt`、`keys.lock`、`lasttime.txt`、`regen.lock`)。これ以外のファイルがあれば異常。
   板の `.html` / `.txt` に生の `<?` や `<%` があれば異常 (エスケープ済みなので、正常なら入らない)。コードのハッシュを控えておけば、書き換えも分かる。
 
 **まだ弱いところ**
-- `lib.php` は、`config.php` があれば自動で `require` する。アプリのフォルダは PHP が書き込める場所なので、将来、書き込みの穴が見つかったときに、そのまま常駐の足がかりになる。設定を PHP ファイルでなく、実行されない形式 (ini / JSON) にするのが望ましい。
+- (直した) `lib.php` は、以前は `config.php` を自動で `require` していた。アプリのフォルダは PHP が書き込める場所なので、書き込みの穴が見つかったときの足がかりになりうるため、実行されない `config.ini` に変えた。キー・型・範囲・文字種を検査して、外れた値は無視する (下の「設定」)。`config.php` は読み込まない。
 - Colab では PHP が root で動き、コードと同じフォルダに鍵やデータが書かれる。コードを読み取り専用にする、データのフォルダを分ける、非 root で動かす、Google ドライブを同じランタイムにマウントしない、が望ましい。
 - `setup_expose.py` が取得する `cloudflared` は、チェックサムを確かめていない。
 
 ## 設定
 
-`config.php` (任意。`.gitignore` 済み) に `define('POST_INTERVAL', 3);` のように書くと、`lib.php` 冒頭の既定値を上書きできる。
+`config.sample.ini` を `config.ini` にコピーして、変えたい行のコメント (`;`) を外す。`config.ini` は PHP として実行されない形式で、`.gitignore` 済み。
+許可リストにあるキーだけを、型・範囲・文字種を検査して使う (外れた値、不明なキー、構文エラーは無視して既定値のまま。理由は `error_log` に出る)。
+値の中の `${…}` や定数名は展開しない (`INI_SCANNER_RAW`)。トリップ・ID・キーの計算に関わる値 (`TRIP_CTX` など、公開後に変えてはいけないもの) は、設定ファイルからは変えられない。
+古い `config.php` は読み込まれない (あれば、ログに「`config.ini` に移してください」と出る)。
 
 公開後に変えてはいけない値は `lib.php` の `const` に分けてある: `TRIP_CTX` `ID_CTX` `TRIP_LEN` `ID_LEN` `TRIP_PASS_MAX`。
 `TRIP_CTX = ''` のあいだは、同じ `trip_secret.txt` を使えば Python 版と同じトリップが出る。
@@ -143,7 +151,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
   `noindex`、`no-referrer`、`no-store`、CSP (nonce つきのスクリプトだけ、他サイトに埋め込めない)。
 - **広告枠**: `ad.html` を置くと、中継ページに「広告」ラベルつきの iframe で出る。`sandbox="allow-scripts allow-popups"` (`allow-same-origin` なし) なので、広告のコードは掲示板のデータに触れない。
   `ad.html` が無ければ何も出ない。広告サービスの規約 (中継ページへの設置など) は、使う前に確認すること。
-- 直リンクに戻すときは、`config.php` に `define('JUMP_ENABLED', false);`。
+- 直リンクに戻すときは、`config.ini` に `JUMP_ENABLED = false`。
 - 既存のスレッド (中継を入れる前の投稿) の直リンクは、書き換えていない。
 
 ## 鍵つきスレッド (認証キー)
@@ -198,9 +206,11 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
 
 ## 検証した内容
 
-- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離) を合わせた 214 項目が一致。
+- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離)・`config.ini` の検査 (型・範囲・文字種・不明なキー・構文エラー) を合わせた 243 項目が一致。
 - `tests/e2e.sh` + `tests/cmp.py`: 同じ投稿 25 通りを Python 版と PHP 版に流し、エラー文言と生成 HTML (スレッド・index・過去ログ) が一致 (日時・ID・番号などは正規化)。
 - `tests/webshell_test.py`: 実行できる形の PHP を置かれたと仮定して、`//x.php` `%2e%2e` `\\` 絶対形式など50通りの経路が、実行されない (404/400、静的 `.html` は文字のまま) こと、本来の経路が動くことを確認。
+- `tests/config_test.py`: `config.ini` の値が使われること、外れた値・`${HOME}` の展開・HTML を含む値が無視されること、`config.php` が**実行されない**こと (副作用のファイルも作られない)、見本がそのまま使えることを、別プロセスで確認。
+- `tests/setup_expose_test.py`: `setup_expose.py` の起動引数で、`system()` などが使えず、`/etc/passwd` の読み込み・`/etc` への書き込み・`http://` の読み込みが拒否されること、アプリに必要な操作 (書き込み・`flock`・`tmpfile()`・`TMPDIR` が別の場所) はできること、動かないときに安全側へ戻ることを確認。
 - `tests/jump_test.py`: 中継ページ (リンクの形、署名の検証、改ざん・ランダムな署名・壊れた入力が通らないこと、鍵を失った場合、広告枠、`res_view` の相対パス、配信) を確認。
 - `tests/lock_test.py` と `tests/lock_retire.php`: 鍵つきスレッド (鍵をかける前後の発行、書き込みの可否、範囲、失効、鍵を外す、フォームの差し替え、配信されないこと、同時のかけ外し、退避時の `.lock`) を確認。
 - `tests/pager.sh` と `tests/unit.php`: ページ送り (実在するページだけ、範囲外は最後のページ、前へ/次への出し分け、1ページの板では出さない、11ページ以上の省略表示、ファイル数) を確認。
@@ -208,7 +218,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
 - 200 スレッドの板 + 5000 レスのスレッドで index 再生成のピークメモリ 0.71MB (`tests/mem.php`)。古いスレッド5万本の板は `tests/mem_old.php`。`memory_limit=3M` でも 5.5MB のスレッドへ投稿できる。
 - `tests/admin_cmp.py`: 管理画面の操作 (ログイン、一覧、レス削除、非表示・復元、不正入力、失敗の回数制限) を Python 版と PHP 版に流して 31 項目一致。
   管理画面の削除と投稿 30 件を同時に流しても、投稿は欠けず、レス番号は増え続け、返信フォームは1つのまま。
-- 配信の許可リスト: 鍵、`cap.txt`、`ng.txt`、`lib.php`、`config.php`、`x〜.html` などは 404。
+- 配信の許可リスト: 鍵、`cap.txt`、`ng.txt`、`lib.php`、`config.php`、`config.ini`、`x〜.html` などは 404。
 
 ## まだ無いもの / 未確認
 

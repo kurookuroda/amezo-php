@@ -165,5 +165,50 @@ chk('中継リンク: 同じ本文は同じ出力 (二重投稿の判定が効�
 chk('中継リンク: 直リンク指定 (false) は元の形', str_contains(linkify_urls('https://a.com/x', false), 'href="https://a.com/x"'), true, 'direct');
 $evil2 = linkify_urls(html_escape('https://a.com/x," onmouseover="alert(1)'), true);
 chk('中継リンク: 属性を抜け出せない', (bool)preg_match('/<[^>]*onmouseover/', $evil2), false, $evil2);
+// ---- config.ini (実行されない設定ファイル。検査を通った値だけを使う) ----
+$cf = tempnam(sys_get_temp_dir(), 'cfg');
+$loadcfg = static function (string $ini) use ($cf): array {
+    file_put_contents($cf, $ini); $e = []; $v = config_load($cf, $e); return [$v, $e];
+};
+[$v, $e] = $loadcfg("; c\nPOST_INTERVAL = 7 ; 行末\nMAX_THREADS = \"50\"\nJUMP_ENABLED = off\nAMEZO = ＠テスト\nTRUSTED_PROXIES[] = 127.0.0.1\nTRUSTED_PROXIES[] = ::1\nURLBASE = http://example.com/\n");
+chk('config: 正しい値は型を直して通る', $v, ['POST_INTERVAL' => 7, 'MAX_THREADS' => 50, 'JUMP_ENABLED' => false, 'AMEZO' => '＠テスト',
+    'TRUSTED_PROXIES' => ['127.0.0.1', '::1'], 'URLBASE' => 'http://example.com/'], 'ok');
+chk('config: 正しい値ならエラーなし', $e, [], 'ok-err');
+$bad = [
+    'ADMIN = "${HOME}"'                         => 'ADMIN',          // 展開されうる文字
+    'SUBJ_MAX = E_ALL'                          => 'SUBJ_MAX',       // 定数名
+    'COMM_MAX = 400abc'                         => 'COMM_MAX',
+    'NAME_MAX ='                                => 'NAME_MAX',       // 空
+    'POST_INTERVAL = 99999'                     => 'POST_INTERVAL',  // 範囲外
+    'POST_INTERVAL = -1'                        => 'POST_INTERVAL',
+    'POST_INTERVAL = 1.5'                       => 'POST_INTERVAL',
+    'HASH_ITERATIONS = 10'                      => 'HASH_ITERATIONS',
+    'AMEZO = <script>alert(1)</script>'         => 'AMEZO',
+    'AMEZO = a"b'                               => 'AMEZO',
+    'AMEZO = a&b'                               => 'AMEZO',
+    'ADMIN ='                                   => 'ADMIN',          // 最小1文字
+    'URLBASE = javascript:alert(1)'             => 'URLBASE',
+    'URLBASE = http://a.com/"><x'               => 'URLBASE',
+    'TRUSTED_PROXIES[] = not-an-ip'             => 'TRUSTED_PROXIES',
+    'JUMP_ENABLED = maybe'                      => 'JUMP_ENABLED',
+    'UNKNOWN_KEY = 1'                           => 'UNKNOWN_KEY',    // 許可リストに無いキー (define されない)
+    'TRIP_CTX = evil'                           => 'TRIP_CTX',       // 公開後に変えてはいけない値は、設定からは変えられない
+    'TRIP_SECRET_FILE = /etc/passwd'            => 'TRIP_SECRET_FILE',
+];
+foreach ($bad as $line => $key) {
+    [$v, $e] = $loadcfg($line . "\n");
+    chk("config: 無視される: $line", [array_key_exists($key, $v), count($e)], [false, 1], $line);
+}
+[$v] = $loadcfg("AMEZO = " . str_repeat('あ', 40) . "\n"); chk('config: 40文字ちょうどは通る', mb_strlen($v['AMEZO'] ?? ''), 40, 'len40');
+[$v] = $loadcfg("AMEZO = " . str_repeat('あ', 41) . "\n"); chk('config: 41文字は通らない', isset($v['AMEZO']), false, 'len41');
+[$v, $e] = $loadcfg("TRUSTED_PROXIES =\n"); chk('config: TRUSTED_PROXIES を空にすると、どのプロキシも信用しない', $v, ['TRUSTED_PROXIES' => []], 'empty-proxy');
+[$v, $e] = $loadcfg("POST_INTERVAL = 3\n[bad\n"); chk('config: 書き方の誤り (構文エラー) は、全体を使わない', [$v, count($e)], [[], 1], 'syntax');
+[$v, $e] = $loadcfg("AMEZO = \"abc\nPOST_INTERVAL = 3\n"); chk('config: 閉じていない引用符の行は無視され、ほかの行は使われる', [$v, count($e)], [['POST_INTERVAL' => 3], 1], 'quote');
+[$v, $e] = $loadcfg("POST_INTERVAL = 3\nPOST_INTERVAL = 99999\nMAX_THREADS = 10\n");
+chk('config: 同じキーが複数あっても、最後の値で検査される', [$v, count($e)], [['MAX_THREADS' => 10], 1], 'dup');
+unlink($cf); $e = [];
+chk('config: ファイルが無ければ空', config_load('/nonexistent/config.ini', $e), [], 'nofile');
+chk('config: 表の既定値は、自分の検査を通る', (function () { foreach (config_schema() as $k => [$t, $d, $mn, $mx]) {
+    if ($t === 'ips' || $t === 'bool') continue; [$ok] = config_check($t, (string)$d, $mn, $mx); if (!$ok) return $k; } return true; })(), true, 'defaults');
 echo "$n checks, $fail failed\n";
 exit($fail ? 1 : 0);

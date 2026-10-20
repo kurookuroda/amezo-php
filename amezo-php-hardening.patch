@@ -1,0 +1,665 @@
+From 771fbe4dedd9f90fba888e800a3cc044e0af7b37 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 04:57:40 +0000
+Subject: [PATCH] =?UTF-8?q?=E8=A8=AD=E5=AE=9A=E3=82=92=20config.ini=20?=
+ =?UTF-8?q?=E3=81=AB=E7=A7=BB=E3=81=97=20(config.php=20=E3=81=AE=E8=87=AA?=
+ =?UTF-8?q?=E5=8B=95=20require=20=E3=82=92=E3=82=84=E3=82=81=E3=82=8B)?=
+ =?UTF-8?q?=E3=80=81PHP=20=E3=82=92=E6=97=A2=E5=AE=9A=E3=81=A7=E5=88=B6?=
+ =?UTF-8?q?=E9=99=90=E3=81=A4=E3=81=8D=E3=81=A7=E8=B5=B7=E5=8B=95=E3=81=99?=
+ =?UTF-8?q?=E3=82=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+config.php → config.ini
+- lib.php は config.php を自動で require していた。アプリのフォルダは PHP が書き込める場所なので、書き込みの穴が
+  見つかったとき、そのまま「自動で実行される足がかり」になりうる
+- config.ini は実行されない形式。INI_SCANNER_RAW で読み (${…} や定数名を展開しない)、キーの許可リスト・型・範囲・文字種を
+  検査して、外れた値・不明なキー・構文エラーは無視して既定値を使う (理由は error_log)
+- TRIP_CTX など公開後に変えてはいけない値は、設定ファイルからは変えられない
+- config.php があれば、読み込まない旨をログに出す。config.sample.ini を追加
+
+setup_expose.py: PHP を既定で制限つきで起動
+- disable_functions (exec/system/proc_open/fsockopen など)、open_basedir (アプリのフォルダと一時フォルダ)、
+  allow_url_fopen=0、allow_url_include=0、expose_php=0 を付ける。一時フォルダは TMPDIR で変わるので、PHP に聞いて含める
+- 起動前に lib.php を読み込む自己テストを、候補 (絞る+制限 → 制限だけ → 絞るだけ → なし) ごとに実行し、動く最初のものを使う
+- --no-harden / --no-trim を追加。起動チェックに //lib.php (400)、/config.ini (404) を追加
+
+tests
+- unit.php に config の検査を追加。config_test.py (config.php が実行されないこと等)、
+  setup_expose_test.py (制限が効くこと、アプリに必要な操作はできること、動かないときに安全側へ戻ること) を追加
+---
+ .gitignore                 |   1 +
+ README.md                  |  24 +++++---
+ config.sample.ini          |  37 ++++++++++++
+ lib.php                    | 114 +++++++++++++++++++++++++++++--------
+ setup_expose.py            |  98 ++++++++++++++++++++++---------
+ tests/config_test.py       |  43 ++++++++++++++
+ tests/lock_test.py         |   2 +-
+ tests/setup_expose_test.py |  81 ++++++++++++++++++++++++++
+ tests/unit.php             |  45 +++++++++++++++
+ 9 files changed, 386 insertions(+), 59 deletions(-)
+ create mode 100644 config.sample.ini
+ create mode 100644 tests/config_test.py
+ create mode 100644 tests/setup_expose_test.py
+
+diff --git a/.gitignore b/.gitignore
+index dbedc45..0663b5b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,4 @@ key_secret.txt
+ keys.txt
+ *.lock
+ jump_secret.txt
++config.ini
+diff --git a/README.md b/README.md
+index 0d40f21..890f142 100644
+--- a/README.md
++++ b/README.md
+@@ -14,6 +14,7 @@ Python 版 (`amezo.py` / `dai.py`) の PHP 移植。スレッドは今までど
+ | `router.php` | `php -S` 用。許可リスト方式で静的ファイルを配る |
+ | `hide.js` | ID / トリップの非表示 (ブラウザの localStorage だけで動く) |
+ | `setup_expose.py` | Colab 用の起動スクリプト (PHP の導入、板フォルダ作成、`php -S`、Cloudflare Tunnel での公開) |
++| `config.sample.ini` | 設定の見本。`config.ini` にコピーして、変えたい行だけ有効にする (実行されない形式) |
+ | `run.sh` | ローカル用 (板フォルダを作って `php -S` を起動。`PORT` `WORKERS` で変更可) |
+ | `tests/` | Python 版との突き合わせ、結合テスト、メモリ測定 |
+ 
+@@ -80,7 +81,7 @@ webshell = 攻撃者が置いた(または書き込ませた) PHP を、あと
+   いまは `parse_url` を使わず、`//`、`%`、`\`、`.` `..` の区間、NUL、`/` で始まらない形 (`http://…`) を 400 で止める。本来の経路は、どれもこれらを使わない。
+   `tests/webshell_test.py` が、この種の経路 (50通り) を毎回確かめる。
+ 
+-**3. 実行されても被害を小さくする (PHP の起動オプション)**
++**3. 実行されても被害を小さくする (PHP の起動オプション。`setup_expose.py` が既定で付ける)**
+ `php -S` の起動に、次を付けても、アプリの全テストが通ることを確認した。コードを実行できた攻撃者が、コマンド実行・外への接続・アプリの外のファイルの読み書きをできなくなる。
+ 
+ ```
+@@ -92,20 +93,27 @@ stream_socket_server,stream_socket_pair,socket_create,socket_create_listen,curl_
+     -S 127.0.0.1:8000 router.php
+ ```
+ 
+-(`setup_expose.py` の既定にはまだ入れていない。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、`disable_functions` の影響は受けない。)
++`setup_expose.py` は、この制限と、拡張の絞り込み (`-n` + mbstring/ctype) を **既定で付けて** `php -S` を起動する。
++起動前に、アプリのフォルダで `lib.php` を読み込む自己テストを、候補ごとに実行し、動く最初のものを使う (絞る + 制限 → 制限だけ → 絞るだけ → なし の順。セキュリティの制限を、メモリの節約より優先して残す)。
++一時フォルダは `TMPDIR` で変わるので、PHP に聞いた場所を `open_basedir` に含める (含めないと `tmpfile()` が使えず、管理画面の削除が壊れる)。
++`--no-harden` で制限なし、`--no-trim` で拡張を絞らない起動にできる (動かないときの切り分け用)。`run.sh` で起動するときは、上のオプションを自分で付ける。
++`disable_functions` は、PHP の中から呼ぶ関数だけを無効にする。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、影響を受けない。
+ 
+ **4. 見つける・気づく**
+ - 板フォルダに置かれるファイル名は決まっている (`数字.html`、`x数字.html`、`o数字.html`、`数字.lock`、`index数字.html`、`kako.html`、`kako.txt`、`keys.txt`、`keys.lock`、`lasttime.txt`、`regen.lock`)。これ以外のファイルがあれば異常。
+   板の `.html` / `.txt` に生の `<?` や `<%` があれば異常 (エスケープ済みなので、正常なら入らない)。コードのハッシュを控えておけば、書き換えも分かる。
+ 
+ **まだ弱いところ**
+-- `lib.php` は、`config.php` があれば自動で `require` する。アプリのフォルダは PHP が書き込める場所なので、将来、書き込みの穴が見つかったときに、そのまま常駐の足がかりになる。設定を PHP ファイルでなく、実行されない形式 (ini / JSON) にするのが望ましい。
++- (直した) `lib.php` は、以前は `config.php` を自動で `require` していた。アプリのフォルダは PHP が書き込める場所なので、書き込みの穴が見つかったときの足がかりになりうるため、実行されない `config.ini` に変えた。キー・型・範囲・文字種を検査して、外れた値は無視する (下の「設定」)。`config.php` は読み込まない。
+ - Colab では PHP が root で動き、コードと同じフォルダに鍵やデータが書かれる。コードを読み取り専用にする、データのフォルダを分ける、非 root で動かす、Google ドライブを同じランタイムにマウントしない、が望ましい。
+ - `setup_expose.py` が取得する `cloudflared` は、チェックサムを確かめていない。
+ 
+ ## 設定
+ 
+-`config.php` (任意。`.gitignore` 済み) に `define('POST_INTERVAL', 3);` のように書くと、`lib.php` 冒頭の既定値を上書きできる。
++`config.sample.ini` を `config.ini` にコピーして、変えたい行のコメント (`;`) を外す。`config.ini` は PHP として実行されない形式で、`.gitignore` 済み。
++許可リストにあるキーだけを、型・範囲・文字種を検査して使う (外れた値、不明なキー、構文エラーは無視して既定値のまま。理由は `error_log` に出る)。
++値の中の `${…}` や定数名は展開しない (`INI_SCANNER_RAW`)。トリップ・ID・キーの計算に関わる値 (`TRIP_CTX` など、公開後に変えてはいけないもの) は、設定ファイルからは変えられない。
++古い `config.php` は読み込まれない (あれば、ログに「`config.ini` に移してください」と出る)。
+ 
+ 公開後に変えてはいけない値は `lib.php` の `const` に分けてある: `TRIP_CTX` `ID_CTX` `TRIP_LEN` `ID_LEN` `TRIP_PASS_MAX`。
+ `TRIP_CTX = ''` のあいだは、同じ `trip_secret.txt` を使えば Python 版と同じトリップが出る。
+@@ -143,7 +151,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+   `noindex`、`no-referrer`、`no-store`、CSP (nonce つきのスクリプトだけ、他サイトに埋め込めない)。
+ - **広告枠**: `ad.html` を置くと、中継ページに「広告」ラベルつきの iframe で出る。`sandbox="allow-scripts allow-popups"` (`allow-same-origin` なし) なので、広告のコードは掲示板のデータに触れない。
+   `ad.html` が無ければ何も出ない。広告サービスの規約 (中継ページへの設置など) は、使う前に確認すること。
+-- 直リンクに戻すときは、`config.php` に `define('JUMP_ENABLED', false);`。
++- 直リンクに戻すときは、`config.ini` に `JUMP_ENABLED = false`。
+ - 既存のスレッド (中継を入れる前の投稿) の直リンクは、書き換えていない。
+ 
+ ## 鍵つきスレッド (認証キー)
+@@ -198,9 +206,11 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ 
+ ## 検証した内容
+ 
+-- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離) を合わせた 214 項目が一致。
++- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離)・`config.ini` の検査 (型・範囲・文字種・不明なキー・構文エラー) を合わせた 243 項目が一致。
+ - `tests/e2e.sh` + `tests/cmp.py`: 同じ投稿 25 通りを Python 版と PHP 版に流し、エラー文言と生成 HTML (スレッド・index・過去ログ) が一致 (日時・ID・番号などは正規化)。
+ - `tests/webshell_test.py`: 実行できる形の PHP を置かれたと仮定して、`//x.php` `%2e%2e` `\\` 絶対形式など50通りの経路が、実行されない (404/400、静的 `.html` は文字のまま) こと、本来の経路が動くことを確認。
++- `tests/config_test.py`: `config.ini` の値が使われること、外れた値・`${HOME}` の展開・HTML を含む値が無視されること、`config.php` が**実行されない**こと (副作用のファイルも作られない)、見本がそのまま使えることを、別プロセスで確認。
++- `tests/setup_expose_test.py`: `setup_expose.py` の起動引数で、`system()` などが使えず、`/etc/passwd` の読み込み・`/etc` への書き込み・`http://` の読み込みが拒否されること、アプリに必要な操作 (書き込み・`flock`・`tmpfile()`・`TMPDIR` が別の場所) はできること、動かないときに安全側へ戻ることを確認。
+ - `tests/jump_test.py`: 中継ページ (リンクの形、署名の検証、改ざん・ランダムな署名・壊れた入力が通らないこと、鍵を失った場合、広告枠、`res_view` の相対パス、配信) を確認。
+ - `tests/lock_test.py` と `tests/lock_retire.php`: 鍵つきスレッド (鍵をかける前後の発行、書き込みの可否、範囲、失効、鍵を外す、フォームの差し替え、配信されないこと、同時のかけ外し、退避時の `.lock`) を確認。
+ - `tests/pager.sh` と `tests/unit.php`: ページ送り (実在するページだけ、範囲外は最後のページ、前へ/次への出し分け、1ページの板では出さない、11ページ以上の省略表示、ファイル数) を確認。
+@@ -208,7 +218,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ - 200 スレッドの板 + 5000 レスのスレッドで index 再生成のピークメモリ 0.71MB (`tests/mem.php`)。古いスレッド5万本の板は `tests/mem_old.php`。`memory_limit=3M` でも 5.5MB のスレッドへ投稿できる。
+ - `tests/admin_cmp.py`: 管理画面の操作 (ログイン、一覧、レス削除、非表示・復元、不正入力、失敗の回数制限) を Python 版と PHP 版に流して 31 項目一致。
+   管理画面の削除と投稿 30 件を同時に流しても、投稿は欠けず、レス番号は増え続け、返信フォームは1つのまま。
+-- 配信の許可リスト: 鍵、`cap.txt`、`ng.txt`、`lib.php`、`config.php`、`x〜.html` などは 404。
++- 配信の許可リスト: 鍵、`cap.txt`、`ng.txt`、`lib.php`、`config.php`、`config.ini`、`x〜.html` などは 404。
+ 
+ ## まだ無いもの / 未確認
+ 
+diff --git a/config.sample.ini b/config.sample.ini
+new file mode 100644
+index 0000000..987c49a
+--- /dev/null
++++ b/config.sample.ini
+@@ -0,0 +1,37 @@
++; config.ini の見本。コピーして config.ini にして、変えたい行のコメント (先頭の ;) を外す。
++; config.ini は PHP として実行されない。キー・型・範囲を検査して、外れた値は無視して既定値を使う (理由は error_log に出る)。
++; 文字列は "" で囲んでも囲まなくてもよい (< > " ' & $ \ と制御文字は使えない)。真偽は true / false。
++
++; 同じ板での連投制限 (秒) 0〜3600
++;POST_INTERVAL = 5
++; 同じ IP の新規スレッド作成の間隔 (秒) 0〜86400
++;GLOBAL_WINDOW = 180
++; これを超えた古いスレッドは o数字.html に退避 (0 なら退避しない) 0〜100000
++;MAX_THREADS = 200
++; 「次のページ」のファイルを再利用する秒数 0〜3600
++;PAGE_CACHE = 10
++
++; 入力の上限
++;MAX_POST_BYTES = 7500
++;SUBJ_MAX = 45
++;NAME_MAX = 25
++;MAIL_MAX = 50
++;COMM_MAX = 400
++;COMM_LINES_MAX = 20
++
++; 板のタイトルの後ろに付く名前 (40文字まで) と、管理者名 (1〜20文字)
++;AMEZO = ＠あめぞう
++;ADMIN = サポート
++;URLBASE = http://ame.x0.com/
++
++; 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする。false なら直リンク
++;JUMP_ENABLED = true
++
++; X-Forwarded-For / CF-Connecting-IP を信用する接続元 (cloudflared など、手前のプロキシの IP)
++;TRUSTED_PROXIES[] = 127.0.0.1
++;TRUSTED_PROXIES[] = ::1
++; どのプロキシも信用しないなら、値を空にする
++;TRUSTED_PROXIES =
++
++; パスワードハッシュの反復回数 (新しく作るハッシュにだけ効く。既存のハッシュは、保存された回数で検証する)
++;HASH_ITERATIONS = 100000
+diff --git a/lib.php b/lib.php
+index 372cc52..38a1d27 100644
+--- a/lib.php
++++ b/lib.php
+@@ -17,30 +17,98 @@ ini_set('log_errors', '1');
+ // 設定
+ // =========================================================================
+ 
+-// ---- 変えてよい設定 -----------------------------------------------------------
+-// config.php があれば先に読む。define('POST_INTERVAL', 3); のように書くと、下の既定値を上書きできる
+-// (config.php は .gitignore に入れてあるので、本番の設定をリポジトリに混ぜずに済む)
+-if (is_file(__DIR__ . '/config.php')) require __DIR__ . '/config.php';
+-foreach ([
+-    'AMEZO'           => '＠あめぞう',
+-    'URLBASE'         => 'http://ame.x0.com/',
+-    'ADMIN'           => 'サポート',
+-    'POST_INTERVAL'   => 5,        // 同じ板での連投制限 (秒)
+-    'GLOBAL_WINDOW'   => 180,      // 同じ IP の新規スレッド作成の間隔 (秒)
+-    'MAX_THREADS'     => 200,      // これを超えた古いスレッドは o数字.html に退避 (0 なら退避しない)
+-    'PAGE_CACHE'      => 10,       // 「次のページ」のファイルを再利用する秒数
+-    'MAX_POST_BYTES'  => 7500,
+-    'SUBJ_MAX'        => 45,
+-    'NAME_MAX'        => 25,
+-    'MAIL_MAX'        => 50,
+-    'COMM_MAX'        => 400,
+-    'COMM_LINES_MAX'  => 20,
+-    'HASH_ITERATIONS' => 100000,
+-    'TRUSTED_PROXIES' => ['127.0.0.1', '::1'],
+-    'JUMP_ENABLED'    => true,     // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする (false なら直リンク)
+-] as $k => $v) {
+-    defined($k) || define($k, $v);
++// ---- 変えてよい設定: config.ini ---------------------------------------------------
++// 設定は config.ini に書く (見本: config.sample.ini)。以前は config.php を require していたが、アプリのフォルダは PHP が
++// 書き込める場所なので、将来 書き込みの穴が見つかったとき、そのまま「自動で実行される足がかり」になってしまう。
++// config.ini は実行されない形式で、さらに「キーの許可リスト・型・範囲・文字種」を検査し、外れた値は無視して既定値を使う。
++// config.ini と config.php は .gitignore に入れてあるので、本番の設定をリポジトリに混ぜずに済む。
++
++/** 設定の表: 名前 => [型, 既定値, 最小, 最大]。最小・最大は、int なら値、text なら文字数、ips なら個数 */
++function config_schema(): array
++{
++    return [
++        'AMEZO'           => ['text', '＠あめぞう', 0, 40],
++        'URLBASE'         => ['url',  'http://ame.x0.com/', 0, 200],
++        'ADMIN'           => ['text', 'サポート', 1, 20],
++        'POST_INTERVAL'   => ['int',  5, 0, 3600],        // 同じ板での連投制限 (秒)
++        'GLOBAL_WINDOW'   => ['int',  180, 0, 86400],     // 同じ IP の新規スレッド作成の間隔 (秒)
++        'MAX_THREADS'     => ['int',  200, 0, 100000],    // これを超えた古いスレッドは o数字.html に退避 (0 なら退避しない)
++        'PAGE_CACHE'      => ['int',  10, 0, 3600],       // 「次のページ」のファイルを再利用する秒数
++        'MAX_POST_BYTES'  => ['int',  7500, 1000, 1000000],
++        'SUBJ_MAX'        => ['int',  45, 1, 500],
++        'NAME_MAX'        => ['int',  25, 1, 200],
++        'MAIL_MAX'        => ['int',  50, 1, 500],
++        'COMM_MAX'        => ['int',  400, 1, 10000],
++        'COMM_LINES_MAX'  => ['int',  20, 1, 1000],
++        'HASH_ITERATIONS' => ['int',  100000, 1000, 5000000],
++        'TRUSTED_PROXIES' => ['ips',  ['127.0.0.1', '::1'], 0, 16],
++        'JUMP_ENABLED'    => ['bool', true, 0, 1],        // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする
++    ];
++}
++
++/** 1つの値を検査する。通れば [true, 型に直した値]、外れれば [false, 理由] */
++function config_check(string $type, mixed $v, int $min, int $max): array
++{
++    switch ($type) {
++        case 'int':
++            if (!is_string($v) || !preg_match('/^-?\d{1,12}$/D', trim($v))) return [false, '整数ではありません'];
++            $n = (int)trim($v);
++            return ($n < $min || $n > $max) ? [false, "{$min}〜{$max} の範囲外です"] : [true, $n];
++        case 'bool':
++            $l = is_string($v) ? strtolower(trim($v)) : '';
++            if (in_array($l, ['1', 'true', 'yes', 'on'], true)) return [true, true];
++            if (in_array($l, ['0', 'false', 'no', 'off'], true)) return [true, false];
++            return [false, 'true / false ではありません'];
++        case 'text':   // 画面にそのまま出す文字列。HTML や展開に使われうる文字は入れさせない
++            if (!is_string($v) || !mb_check_encoding($v, 'UTF-8')) return [false, '文字列ではありません'];
++            if (preg_match('/[\x00-\x1f\x7f<>"\'&$\\\\]/', $v)) return [false, '使えない文字 (制御文字 < > " \' & $ \\) を含みます'];
++            $len = mb_strlen($v, 'UTF-8');
++            return ($len < $min || $len > $max) ? [false, "{$min}〜{$max} 文字ではありません"] : [true, $v];
++        case 'url':
++            if (!is_string($v) || strlen($v) > $max || ($v !== '' && !preg_match('#^https?://[A-Za-z0-9][A-Za-z0-9.\-:/_]*$#D', $v))) {
++                return [false, 'http:// か https:// で始まる URL ではありません'];
++            }
++            return [true, $v];
++        case 'ips':
++            if ($v === '') return [true, []];                       // 「TRUSTED_PROXIES =」 は、どのプロキシも信用しない
++            if (!is_array($v) || count($v) > $max) return [false, 'IP アドレスの並びではありません'];
++            foreach ($v as $ip) {
++                if (!is_string($ip) || !filter_var(trim($ip), FILTER_VALIDATE_IP)) return [false, 'IP アドレスではない値があります'];
++            }
++            return [true, array_values(array_map('trim', $v))];
++    }
++    return [false, '未対応の型です'];
++}
++
++/** config.ini を読み、検査を通った値だけを返す。無視した値と理由は $errors に入れる */
++function config_load(string $file, array &$errors = []): array
++{
++    if (!is_file($file)) return [];
++    // INI_SCANNER_RAW: ${…} の展開や、定数名の置き換えをさせない (値はすべて文字列で来るので、自分で型を検査する)
++    $raw = @parse_ini_file($file, false, INI_SCANNER_RAW);
++    if ($raw === false) {
++        $errors[] = '読み込めません (書き方の誤り)';
++        return [];
++    }
++    $schema = config_schema();
++    $out = [];
++    foreach ($raw as $k => $v) {
++        if (!isset($schema[$k])) { $errors[] = "不明なキー: {$k}"; continue; }
++        [$ok, $val] = config_check($schema[$k][0], $v, $schema[$k][2], $schema[$k][3]);
++        if ($ok) $out[$k] = $val;
++        else $errors[] = "{$k}: {$val}";
++    }
++    return $out;
++}
++
++$_cfg_errors = [];
++$_cfg = config_load(__DIR__ . '/config.ini', $_cfg_errors);
++foreach ($_cfg_errors as $_e) error_log("amezo: config.ini の {$_e} (無視して、既定値を使います)");
++if (is_file(__DIR__ . '/config.php')) error_log('amezo: config.php は読み込みません (PHP ファイルは自動で実行されるため)。config.ini に移してください');
++foreach (config_schema() as $_k => $_spec) {
++    defined($_k) || define($_k, $_cfg[$_k] ?? $_spec[1]);            // テストなどで先に define() された値は、そのまま使う
+ }
++unset($_cfg_errors, $_cfg, $_e, $_k, $_spec);
+ 
+ // ---- 公開後に変えてはいけない仕様 (変えるとトリップ/IDが全員変わる) ----------
+ const TRIP_CTX      = '';          // トリップ計算の接頭辞。空 = Python 版と同じトリップ
+diff --git a/setup_expose.py b/setup_expose.py
+index 876f3c5..9f7f61d 100644
+--- a/setup_expose.py
++++ b/setup_expose.py
+@@ -15,6 +15,8 @@
+ #     !python3 setup_expose.py                         # 起動 (Ctrl+C / セルの停止で止まる)
+ #   ローカルで試すだけ (トンネルなし):
+ #     python3 setup_expose.py --no-tunnel
++#   PHP は既定で「実行系の関数を無効にし、ファイルアクセスをアプリのフォルダ (と一時フォルダ) に閉じ込めて」起動する
++#   (万一、PHP のコードを実行されても、コマンド実行・外への接続・アプリの外のファイル操作ができないようにする)。--no-harden で無効にできる。
+ #   メモリを節約したいとき (起動後に、このランチャー自身は終了して、PHP とトンネルだけを残す):
+ #     !python3 setup_expose.py --detach        # 止めるとき: !pkill -x php; pkill -x cloudflared
+ 
+@@ -111,37 +113,76 @@ def ensure_php():
+ 
+ REQUIRED_FUNCS = ["ctype_digit", "ctype_xdigit", "filter_var", "inet_pton", "hash_hmac", "hash_pbkdf2", "hash_equals",
+                   "random_bytes", "mb_check_encoding", "mb_convert_encoding", "mb_scrub", "mb_chr", "mb_ord", "mb_substr",
+-                  "preg_match_all", "flock", "stream_copy_to_stream", "tmpfile"]
++                  "preg_match_all", "flock", "stream_copy_to_stream", "tmpfile", "parse_ini_file", "base64_encode", "parse_url"]
+ 
++# コードを実行できた攻撃者に使わせない関数。アプリ本体はどれも使っていない (走査で確認)。
++# setup_expose.py が PHP を起動するのは Python の subprocess なので、ここで無効にしても影響しない。
++DISABLED_FUNCS = ["exec", "passthru", "shell_exec", "system", "proc_open", "popen", "pcntl_exec", "dl", "mail", "show_source",
++                  "highlight_file", "phpinfo", "posix_kill", "posix_setuid", "posix_setgid", "posix_mkfifo", "symlink", "link",
++                  "putenv", "fsockopen", "pfsockopen", "stream_socket_client", "stream_socket_server", "stream_socket_pair",
++                  "socket_create", "socket_create_listen", "curl_exec", "curl_multi_exec", "proc_nice", "proc_terminate",
++                  "proc_get_status"]
+ 
+-def php_runtime_args(trim=True):
+-    """
+-    php に渡す起動引数。
+-    trim=True のときは php.ini を読まず (-n)、必要な拡張 (mbstring, ctype) だけを読み込む。
+-    余計な拡張 (約20個) を読み込まないぶん、常駐メモリが 5MB ほど減る。
+-    必要な関数が1つでも欠けるときは、安全のため通常の起動 (空の引数) に戻す。
+-    """
+-    limit = ["-d", "memory_limit=32M"]       # 想定外の入力でメモリを使い切らないための上限 (5MBのスレッドでも 3MB で足りる)
+-    if not trim:
+-        return limit
++# アプリのフォルダで lib.php を読み込み、必要な関数が揃っていて動くかを確かめる (何も書かない)
++SELF_TEST = ("foreach (" + "[" + ",".join(f'"{f}"' for f in REQUIRED_FUNCS) + "] as $f) if (!function_exists($f)) { echo $f; exit(1); } "
++             'require "lib.php"; echo (linkify_urls("https://a.com/x", false) !== "" && mb_strlen("あ") === 1 && ctype_digit("1")) ? "OK" : "NG";')
++
++
++def run_php(args, cwd=None):
+     try:
+-        ext_dir = subprocess.run(["php", "-r", 'echo ini_get("extension_dir");'], capture_output=True, text=True, timeout=15).stdout.strip()
++        r = subprocess.run(["php", *args], capture_output=True, text=True, timeout=20, cwd=cwd)
++        return r.returncode, r.stdout.strip(), r.stderr.strip()
+     except (OSError, subprocess.SubprocessError):
+-        return limit
++        return -1, "", ""
++
++
++def trim_args():
++    """php.ini を読まず (-n)、必要な拡張 (mbstring, ctype) だけを読み込む。余計な拡張を読み込まないぶん、常駐メモリが 5MB ほど減る"""
++    rc, ext_dir, _ = run_php(["-r", 'echo ini_get("extension_dir");'])
+     args = ["-n"]
+     for ext in ("mbstring", "ctype"):
+         so = os.path.join(ext_dir, ext + ".so")
+         if os.path.exists(so):
+             args += ["-d", f"extension={so}"]
+-    check = "foreach (" + "[" + ",".join(f'"{f}"' for f in REQUIRED_FUNCS) + "] as $f) if (!function_exists($f)) { echo $f; exit(1); }"
+-    try:
+-        r = subprocess.run(["php", *args, "-r", check], capture_output=True, text=True, timeout=15)
+-    except (OSError, subprocess.SubprocessError):
+-        return limit
+-    if r.returncode != 0:
+-        print(f"  ℹ️ 拡張を絞った起動は使えません ({r.stdout.strip() or '確認に失敗'} が無い)。通常の起動にします。")
+-        return limit
+-    return args + limit
++    return args
++
++
++def harden_args():
++    """実行系の関数を無効にし、ファイルアクセスをアプリのフォルダと一時フォルダに閉じ込め、URL の読み込みを禁止する"""
++    rc, tmp, _ = run_php(["-r", "echo sys_get_temp_dir();"])
++    dirs = []
++    for d in (BASE_DIR, tmp or "/tmp"):                  # 一時フォルダは TMPDIR で変わる。tmpfile() が使えるように含める
++        d = os.path.realpath(d).rstrip("/") + "/"
++        if d not in dirs:
++            dirs.append(d)
++    return ["-d", "expose_php=0", "-d", "allow_url_fopen=0", "-d", "allow_url_include=0",
++            "-d", "open_basedir=" + ":".join(dirs), "-d", "disable_functions=" + ",".join(DISABLED_FUNCS)]
++
++
++def php_runtime_args(trim=True, harden=True):
++    """
++    php に渡す起動引数と、実際に使えた設定 {'trim': bool, 'harden': bool} を返す。
++    候補を、(絞る + 制限) → (制限だけ) → (絞るだけ) → (どちらもなし) の順に、実際に lib.php を読み込む自己テストで確かめて、
++    最初に動いたものを使う。セキュリティの制限を、メモリの節約よりも優先して残す。
++    """
++    limit = ["-d", "memory_limit=32M"]                   # 想定外の入力でメモリを使い切らないための上限
++    t = trim_args() if trim else []
++    h = harden_args() if harden else []
++    candidates = [(t, h)]
++    if h and t: candidates.append(([], h))
++    if t: candidates.append((t, []))
++    if h or t: candidates.append(([], []))
++    for ta, ha in candidates:
++        args = ta + ha + limit
++        rc, out, err = run_php([*args, "-r", SELF_TEST], cwd=BASE_DIR)
++        if rc == 0 and out.endswith("OK"):
++            if (trim and not ta) or (harden and not ha):
++                dropped = ("拡張の絞り込み" if trim and not ta else "") + (" と " if (trim and not ta) and (harden and not ha) else "") + ("実行系の制限" if harden and not ha else "")
++                print(f"  ℹ️ {dropped}を外して起動します。")
++            return args, {"trim": bool(ta), "harden": bool(ha)}
++        reason = (out or err or "確認に失敗").splitlines()[0][:100]
++        print(f"  ℹ️ 候補 (絞る={'はい' if ta else 'いいえ'}, 制限={'はい' if ha else 'いいえ'}) は使えません: {reason}")
++    return limit, {"trim": False, "harden": False}
+ 
+ 
+ # ---- 事前チェックと準備 -------------------------------------------------------
+@@ -218,9 +259,9 @@ def cleanup_old_processes(port):
+ 
+ # ---- Web サーバー (php -S) ------------------------------------------------------
+ 
+-def start_php_server(port, workers, verbose=False, detach=False, trim=True):
+-    runtime = php_runtime_args(trim)
+-    note = "拡張を絞って" if "-n" in runtime else "通常の設定で"
++def start_php_server(port, workers, verbose=False, detach=False, trim=True, harden=True):
++    runtime, info = php_runtime_args(trim, harden)
++    note = ("拡張を絞り、" if info["trim"] else "通常の拡張で、") + ("実行系を制限して" if info["harden"] else "制限なしで")
+     print(f"🚀 PHP Webサーバーを起動しています ({note}、ポート {port}, ワーカー {workers})...")
+     env = dict(os.environ, PHP_CLI_SERVER_WORKERS=str(workers))
+     cmd = ["php", *runtime, "-S", f"127.0.0.1:{port}", "router.php"]
+@@ -267,9 +308,9 @@ def self_check(port):
+     """起動直後の確認: 板一覧は出る / 鍵やパスワードや PHP のソースは配られない"""
+     print("🔎 起動チェック:")
+     good = True
+-    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
++    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200), ("//lib.php", 400), ("/lib.php", 404),
+                        ("/trip_secret.txt", 404), ("/id_secret.txt", 404), ("/delpass.txt", 404),
+-                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404),
++                       ("/cap.txt", 404), ("/blist.txt", 404), ("/config.ini", 404),
+                        ("/key_secret.txt", 404), ("/jump_secret.txt", 404)]:
+         got = http_status(port, path)
+         mark = "✅" if got == want else "❌"
+@@ -360,6 +401,7 @@ def main():
+     ap.add_argument("--detach", action="store_true",
+                     help="起動できたらランチャーは終了し、PHP とトンネルだけを残す (メモリ節約。ログは php.log / cloudflared.log)")
+     ap.add_argument("--no-trim", action="store_true", help="PHP の拡張を絞らず、通常の設定で起動する")
++    ap.add_argument("--no-harden", action="store_true", help="PHP の実行系の関数・ファイルアクセスの制限をかけずに起動する (動かないときの切り分け用)")
+     args = ap.parse_args()
+ 
+     # __file__ が無い環境 (Jupyter/Colab) では os.getcwd() を使う
+@@ -377,7 +419,7 @@ def main():
+     cleanup_old_processes(args.port)
+     setup_bbs_directories()
+ 
+-    php_proc = start_php_server(args.port, args.workers, args.verbose, args.detach, not args.no_trim)
++    php_proc = start_php_server(args.port, args.workers, args.verbose, args.detach, not args.no_trim, not args.no_harden)
+     tunnel_proc = None
+     keep_running = False
+ 
+diff --git a/tests/config_test.py b/tests/config_test.py
+new file mode 100644
+index 0000000..e0cdc86
+--- /dev/null
++++ b/tests/config_test.py
+@@ -0,0 +1,43 @@
++# config.ini / config.php の扱いの確認: lib.php を読み込む別プロセスで、定数がどうなるかを見る
++import json, os, shutil, subprocess, sys, tempfile
++SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib.php')
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++def run(files, pre=''):
++    d = tempfile.mkdtemp(prefix='cfgtest')
++    shutil.copy(SRC, d + '/lib.php')
++    for name, body in files.items(): open(f'{d}/{name}', 'w', encoding='utf-8').write(body)
++    code = f'{pre} require "lib.php"; echo json_encode([POST_INTERVAL, MAX_THREADS, JUMP_ENABLED, AMEZO, ADMIN, TRUSTED_PROXIES], JSON_UNESCAPED_UNICODE);'
++    r = subprocess.run(['php', '-d', 'log_errors=1', '-d', 'error_log=', '-r', code], cwd=d, capture_output=True, text=True)
++    made = sorted(set(os.listdir(d)) - set(files) - {'lib.php'})
++    shutil.rmtree(d)
++    try: vals = json.loads(r.stdout)
++    except Exception: vals = None
++    return vals, r.stderr, made
++D = [5, 200, True, '＠あめぞう', 'サポート', ['127.0.0.1', '::1']]       # 既定値
++v, err, _ = run({})
++ok('設定ファイルが無ければ既定値', v == D and 'amezo:' not in err, str(v))
++v, err, _ = run({'config.ini': 'POST_INTERVAL = 0\nMAX_THREADS = 3\nJUMP_ENABLED = false\nAMEZO = ＠テスト\nADMIN = 管理人\nTRUSTED_PROXIES[] = 10.0.0.1\n'})
++ok('config.ini の値が使われる', v == [0, 3, False, '＠テスト', '管理人', ['10.0.0.1']] and 'amezo:' not in err, str(v))
++v, err, _ = run({'config.ini': 'POST_INTERVAL = 99999\nADMIN = "${HOME}"\nAMEZO = <b>x\nMAX_THREADS = 3\nUNKNOWN = 1\n'})
++ok('外れた値・不明なキーは無視して既定値 (有効な値だけ使う)', v == [5, 3, True, '＠あめぞう', 'サポート', ['127.0.0.1', '::1']], str(v))
++ok('無視した理由が error_log に出る (4件)', err.count('amezo: config.ini の') == 4, err.count('amezo: config.ini の').__str__())
++# --- config.php は実行しない ---
++php_evil = "<?php define('POST_INTERVAL', 99); file_put_contents('pwned.txt', 'executed');\n"
++v, err, made = run({'config.php': php_evil})
++ok('config.php は実行されない (定数も、ファイルの作成も起きない)', v == D and 'pwned.txt' not in made, f'{v} {made}')
++ok('config.php があれば、読み込まないことをログに出す', 'config.php は読み込みません' in err)
++v, err, made = run({'config.php': php_evil, 'config.ini': 'POST_INTERVAL = 2\n'})
++ok('config.ini と config.php が両方あっても、config.ini だけが効く', v[0] == 2 and 'pwned.txt' not in made, str(v))
++# --- 先に define() された値 (テストの仕組み) は、設定ファイルより優先 ---
++v, err, _ = run({'config.ini': 'POST_INTERVAL = 7\n'}, pre="define('POST_INTERVAL', 1);")
++ok('先に define() された値が優先される (テスト用)', v[0] == 1, str(v))
++# --- 見本は、そのまま使える ---
++d = tempfile.mkdtemp(prefix='cfgtest'); shutil.copy(SRC, d + '/lib.php')
++shutil.copy(os.path.join(os.path.dirname(SRC), 'config.sample.ini'), d + '/config.ini')
++r = subprocess.run(['php', '-r', 'require "lib.php"; echo POST_INTERVAL;'], cwd=d, capture_output=True, text=True); shutil.rmtree(d)
++ok('config.sample.ini をそのまま config.ini にしても、エラーなし・既定値', r.stdout == '5' and 'amezo:' not in r.stderr, r.stderr[:80])
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
+diff --git a/tests/lock_test.py b/tests/lock_test.py
+index ceeeb87..e14959b 100644
+--- a/tests/lock_test.py
++++ b/tests/lock_test.py
+@@ -1,5 +1,5 @@
+ # 鍵つきスレッドの結合テスト (PHP 版だけ)。
+-# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動、config.php で POST_INTERVAL/GLOBAL_WINDOW=0、
++# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動、config.ini で POST_INTERVAL=0, GLOBAL_WINDOW=0、
+ #       管理用パスワード adminpw の delpass.txt、板 adm と main がある
+ import os, re, sys, time, urllib.request, urllib.parse, urllib.error
+ from concurrent.futures import ThreadPoolExecutor
+diff --git a/tests/setup_expose_test.py b/tests/setup_expose_test.py
+new file mode 100644
+index 0000000..413b5ae
+--- /dev/null
++++ b/tests/setup_expose_test.py
+@@ -0,0 +1,81 @@
++# setup_expose.py の PHP 起動オプションの確認: 制限が本当に効くこと、アプリに必要なことはできること、動かないときは安全に戻ること
++import json, os, shutil, sys, tempfile
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
++import setup_expose as se
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
++app = tempfile.mkdtemp(prefix='hardapp'); shutil.copy(f'{root}/lib.php', f'{app}/lib.php')
++se.BASE_DIR = os.path.realpath(app)
++
++PROBE = r'''
++$r = [];
++foreach (["system", "shell_exec", "exec", "passthru", "proc_open", "popen", "fsockopen", "phpinfo", "mail", "putenv"] as $f) $r[$f] = function_exists($f) ? "CALLABLE" : "disabled";
++$r["read /etc/passwd"]   = @file_get_contents("/etc/passwd") === false ? "denied" : "READ";
++$r["write /etc/x"]       = @file_put_contents("/etc/amezo_probe", "x") === false ? "denied" : "WROTE";
++$r["write /root/x"]      = @file_put_contents("/root/amezo_probe", "x") === false ? "denied" : "WROTE";
++$r["list /"]             = @scandir("/") === false ? "denied" : "LISTED";
++$r["read http://"]       = @file_get_contents("http://127.0.0.1:9/") === false ? "denied" : "READ";
++$inc = @include "http://127.0.0.1:9/x.php"; $r["include http://"] = $inc === false ? "denied" : "INCLUDED";
++$r["read ../ (親)"]      = @file_get_contents(__DIR__ . "/../hardprobe") === false ? "denied" : "READ";
++$f = __DIR__ . "/data.txt";
++$r["app: write+read"]    = (file_put_contents($f, "ok") === 2 && file_get_contents($f) === "ok") ? "ok" : "FAIL";
++$r["app: mkdir+rename"]  = (mkdir(__DIR__ . "/board") && rename($f, __DIR__ . "/board/data.txt") && is_file(__DIR__ . "/board/data.txt")) ? "ok" : "FAIL";
++$r["app: flock"]         = (($h = fopen(__DIR__ . "/board/data.txt", "r+")) && flock($h, LOCK_EX)) ? "ok" : "FAIL";
++$t = tmpfile(); $r["app: tmpfile()"] = ($t !== false && fwrite($t, "x") === 1) ? "ok" : "FAIL";
++$r["app: tempnam(tmp)"]  = ($n = tempnam(sys_get_temp_dir(), "hp")) && file_put_contents($n, "x") ? "ok" : "FAIL"; if ($n) @unlink($n);
++$r["app: ini_set"]       = @ini_set("display_errors", "0") !== false ? "ok" : "FAIL";
++echo json_encode($r, JSON_UNESCAPED_UNICODE);
++'''
++def probe(args, cwd):
++    open(f'{cwd}/probe.php', 'w').write('<?php ' + PROBE)
++    rc, out, err = se.run_php([*args, f'{cwd}/probe.php'], cwd=cwd)
++    try: return json.loads(out)
++    except Exception: return {'ERROR': out or err}
++
++# --- 1. 既定の起動引数 ---
++args, info = se.php_runtime_args()
++ok('既定で、拡張を絞り、実行系を制限する', info == {'trim': True, 'harden': True}, str(info))
++flat = ' '.join(args)
++ok('open_basedir にアプリのフォルダと一時フォルダ (末尾 /)', f'open_basedir={se.BASE_DIR}/' in flat and ('/tmp/' in flat.split('open_basedir=')[1].split(' ')[0]))
++ok('disable_functions / allow_url_* / expose_php / memory_limit', all(x in flat for x in ['disable_functions=exec,', 'allow_url_fopen=0', 'allow_url_include=0', 'expose_php=0', 'memory_limit=32M']))
++ok('必要な関数が、無効にする関数と重なっていない', not (set(se.REQUIRED_FUNCS) & set(se.DISABLED_FUNCS)), str(set(se.REQUIRED_FUNCS) & set(se.DISABLED_FUNCS)))
++r = probe(args, se.BASE_DIR)
++for k in ["system", "shell_exec", "exec", "passthru", "proc_open", "popen", "fsockopen", "phpinfo", "mail", "putenv"]:
++    ok(f'制限あり: {k}() は使えない', r.get(k) == 'disabled', r.get(k, str(r)))
++for k in ["read /etc/passwd", "write /etc/x", "write /root/x", "list /", "read http://", "include http://", "read ../ (親)"]:
++    ok(f'制限あり: {k} は拒否される', r.get(k) == 'denied', r.get(k, str(r)))
++for k in ["app: write+read", "app: mkdir+rename", "app: flock", "app: tmpfile()", "app: tempnam(tmp)", "app: ini_set"]:
++    ok(f'制限あり: アプリに必要な操作はできる {k}', r.get(k) == 'ok', r.get(k, str(r)))
++# --- 比較: 制限なしなら、同じ操作が通ってしまう ---
++shutil.rmtree(f'{se.BASE_DIR}/board', ignore_errors=True)
++r0 = probe(['-n', '-d', 'extension=' + os.path.join(se.run_php(['-r', 'echo ini_get("extension_dir");'])[1], 'mbstring.so')], se.BASE_DIR)
++ok('比較: 制限なしでは system() が使える / /etc/passwd が読める (制限が効いている証拠)', r0.get('system') == 'CALLABLE' and r0.get('read /etc/passwd') == 'READ', f"{r0.get('system')}, {r0.get('read /etc/passwd')}")
++# --- 2. 一時フォルダが TMPDIR で別の場所でも、tmpfile() が使える ---
++shutil.rmtree(f'{se.BASE_DIR}/board', ignore_errors=True)
++os.makedirs('/var/tmp', exist_ok=True); os.environ['TMPDIR'] = '/var/tmp'
++args2, info2 = se.php_runtime_args()
++ok('TMPDIR=/var/tmp でも、open_basedir に /var/tmp/ を含む', '/var/tmp/' in ' '.join(args2) and info2['harden'], str(info2))
++r2 = probe(args2, se.BASE_DIR)
++ok('TMPDIR=/var/tmp でも tmpfile() / tempnam() が動く', r2.get('app: tmpfile()') == 'ok' and r2.get('app: tempnam(tmp)') == 'ok', str((r2.get('app: tmpfile()'), r2.get('app: tempnam(tmp)'))))
++del os.environ['TMPDIR']
++# --- 3. 動かないときは、安全側に戻る (制限を優先して残す) ---
++shutil.rmtree(f'{se.BASE_DIR}/board', ignore_errors=True)
++se.DISABLED_FUNCS.append('hash_hmac')       # 必要な関数を無効にしてしまった場合を再現
++a3, i3 = se.php_runtime_args()
++se.DISABLED_FUNCS.remove('hash_hmac')
++ok('必要な関数が無効だと、制限なしの候補に戻る (動かないまま起動しない)', i3 == {'trim': True, 'harden': False} and 'disable_functions' not in ' '.join(a3), str(i3))
++os.remove(f'{se.BASE_DIR}/lib.php')
++a4, i4 = se.php_runtime_args()
++ok('lib.php が読めないとき (何も確認できない) は、最小の引数に戻る', i4 == {'trim': False, 'harden': False} and a4 == ['-d', 'memory_limit=32M'], str(i4))
++# --- 4. --no-harden / --no-trim ---
++shutil.copy(f'{root}/lib.php', f'{se.BASE_DIR}/lib.php')
++a5, i5 = se.php_runtime_args(trim=True, harden=False)
++ok('harden=False: 絞るだけ', i5 == {'trim': True, 'harden': False} and 'open_basedir' not in ' '.join(a5), str(i5))
++a6, i6 = se.php_runtime_args(trim=False, harden=True)
++ok('trim=False: 制限だけ (php.ini は読む)', i6 == {'trim': False, 'harden': True} and '-n' not in a6 and 'open_basedir' in ' '.join(a6), str(i6))
++shutil.rmtree(app, ignore_errors=True)
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
+diff --git a/tests/unit.php b/tests/unit.php
+index b4fc0c4..4529872 100644
+--- a/tests/unit.php
++++ b/tests/unit.php
+@@ -165,5 +165,50 @@ chk('中継リンク: 同じ本文は同じ出力 (二重投稿の判定が効
+ chk('中継リンク: 直リンク指定 (false) は元の形', str_contains(linkify_urls('https://a.com/x', false), 'href="https://a.com/x"'), true, 'direct');
+ $evil2 = linkify_urls(html_escape('https://a.com/x," onmouseover="alert(1)'), true);
+ chk('中継リンク: 属性を抜け出せない', (bool)preg_match('/<[^>]*onmouseover/', $evil2), false, $evil2);
++// ---- config.ini (実行されない設定ファイル。検査を通った値だけを使う) ----
++$cf = tempnam(sys_get_temp_dir(), 'cfg');
++$loadcfg = static function (string $ini) use ($cf): array {
++    file_put_contents($cf, $ini); $e = []; $v = config_load($cf, $e); return [$v, $e];
++};
++[$v, $e] = $loadcfg("; c\nPOST_INTERVAL = 7 ; 行末\nMAX_THREADS = \"50\"\nJUMP_ENABLED = off\nAMEZO = ＠テスト\nTRUSTED_PROXIES[] = 127.0.0.1\nTRUSTED_PROXIES[] = ::1\nURLBASE = http://example.com/\n");
++chk('config: 正しい値は型を直して通る', $v, ['POST_INTERVAL' => 7, 'MAX_THREADS' => 50, 'JUMP_ENABLED' => false, 'AMEZO' => '＠テスト',
++    'TRUSTED_PROXIES' => ['127.0.0.1', '::1'], 'URLBASE' => 'http://example.com/'], 'ok');
++chk('config: 正しい値ならエラーなし', $e, [], 'ok-err');
++$bad = [
++    'ADMIN = "${HOME}"'                         => 'ADMIN',          // 展開されうる文字
++    'SUBJ_MAX = E_ALL'                          => 'SUBJ_MAX',       // 定数名
++    'COMM_MAX = 400abc'                         => 'COMM_MAX',
++    'NAME_MAX ='                                => 'NAME_MAX',       // 空
++    'POST_INTERVAL = 99999'                     => 'POST_INTERVAL',  // 範囲外
++    'POST_INTERVAL = -1'                        => 'POST_INTERVAL',
++    'POST_INTERVAL = 1.5'                       => 'POST_INTERVAL',
++    'HASH_ITERATIONS = 10'                      => 'HASH_ITERATIONS',
++    'AMEZO = <script>alert(1)</script>'         => 'AMEZO',
++    'AMEZO = a"b'                               => 'AMEZO',
++    'AMEZO = a&b'                               => 'AMEZO',
++    'ADMIN ='                                   => 'ADMIN',          // 最小1文字
++    'URLBASE = javascript:alert(1)'             => 'URLBASE',
++    'URLBASE = http://a.com/"><x'               => 'URLBASE',
++    'TRUSTED_PROXIES[] = not-an-ip'             => 'TRUSTED_PROXIES',
++    'JUMP_ENABLED = maybe'                      => 'JUMP_ENABLED',
++    'UNKNOWN_KEY = 1'                           => 'UNKNOWN_KEY',    // 許可リストに無いキー (define されない)
++    'TRIP_CTX = evil'                           => 'TRIP_CTX',       // 公開後に変えてはいけない値は、設定からは変えられない
++    'TRIP_SECRET_FILE = /etc/passwd'            => 'TRIP_SECRET_FILE',
++];
++foreach ($bad as $line => $key) {
++    [$v, $e] = $loadcfg($line . "\n");
++    chk("config: 無視される: $line", [array_key_exists($key, $v), count($e)], [false, 1], $line);
++}
++[$v] = $loadcfg("AMEZO = " . str_repeat('あ', 40) . "\n"); chk('config: 40文字ちょうどは通る', mb_strlen($v['AMEZO'] ?? ''), 40, 'len40');
++[$v] = $loadcfg("AMEZO = " . str_repeat('あ', 41) . "\n"); chk('config: 41文字は通らない', isset($v['AMEZO']), false, 'len41');
++[$v, $e] = $loadcfg("TRUSTED_PROXIES =\n"); chk('config: TRUSTED_PROXIES を空にすると、どのプロキシも信用しない', $v, ['TRUSTED_PROXIES' => []], 'empty-proxy');
++[$v, $e] = $loadcfg("POST_INTERVAL = 3\n[bad\n"); chk('config: 書き方の誤り (構文エラー) は、全体を使わない', [$v, count($e)], [[], 1], 'syntax');
++[$v, $e] = $loadcfg("AMEZO = \"abc\nPOST_INTERVAL = 3\n"); chk('config: 閉じていない引用符の行は無視され、ほかの行は使われる', [$v, count($e)], [['POST_INTERVAL' => 3], 1], 'quote');
++[$v, $e] = $loadcfg("POST_INTERVAL = 3\nPOST_INTERVAL = 99999\nMAX_THREADS = 10\n");
++chk('config: 同じキーが複数あっても、最後の値で検査される', [$v, count($e)], [['MAX_THREADS' => 10], 1], 'dup');
++unlink($cf); $e = [];
++chk('config: ファイルが無ければ空', config_load('/nonexistent/config.ini', $e), [], 'nofile');
++chk('config: 表の既定値は、自分の検査を通る', (function () { foreach (config_schema() as $k => [$t, $d, $mn, $mx]) {
++    if ($t === 'ips' || $t === 'bool') continue; [$ok] = config_check($t, (string)$d, $mn, $mx); if (!$ok) return $k; } return true; })(), true, 'defaults');
+ echo "$n checks, $fail failed\n";
+ exit($fail ? 1 : 0);
+-- 
+2.43.0
+

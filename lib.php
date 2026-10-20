@@ -17,30 +17,98 @@ ini_set('log_errors', '1');
 // 設定
 // =========================================================================
 
-// ---- 変えてよい設定 -----------------------------------------------------------
-// config.php があれば先に読む。define('POST_INTERVAL', 3); のように書くと、下の既定値を上書きできる
-// (config.php は .gitignore に入れてあるので、本番の設定をリポジトリに混ぜずに済む)
-if (is_file(__DIR__ . '/config.php')) require __DIR__ . '/config.php';
-foreach ([
-    'AMEZO'           => '＠あめぞう',
-    'URLBASE'         => 'http://ame.x0.com/',
-    'ADMIN'           => 'サポート',
-    'POST_INTERVAL'   => 5,        // 同じ板での連投制限 (秒)
-    'GLOBAL_WINDOW'   => 180,      // 同じ IP の新規スレッド作成の間隔 (秒)
-    'MAX_THREADS'     => 200,      // これを超えた古いスレッドは o数字.html に退避 (0 なら退避しない)
-    'PAGE_CACHE'      => 10,       // 「次のページ」のファイルを再利用する秒数
-    'MAX_POST_BYTES'  => 7500,
-    'SUBJ_MAX'        => 45,
-    'NAME_MAX'        => 25,
-    'MAIL_MAX'        => 50,
-    'COMM_MAX'        => 400,
-    'COMM_LINES_MAX'  => 20,
-    'HASH_ITERATIONS' => 100000,
-    'TRUSTED_PROXIES' => ['127.0.0.1', '::1'],
-    'JUMP_ENABLED'    => true,     // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする (false なら直リンク)
-] as $k => $v) {
-    defined($k) || define($k, $v);
+// ---- 変えてよい設定: config.ini ---------------------------------------------------
+// 設定は config.ini に書く (見本: config.sample.ini)。以前は config.php を require していたが、アプリのフォルダは PHP が
+// 書き込める場所なので、将来 書き込みの穴が見つかったとき、そのまま「自動で実行される足がかり」になってしまう。
+// config.ini は実行されない形式で、さらに「キーの許可リスト・型・範囲・文字種」を検査し、外れた値は無視して既定値を使う。
+// config.ini と config.php は .gitignore に入れてあるので、本番の設定をリポジトリに混ぜずに済む。
+
+/** 設定の表: 名前 => [型, 既定値, 最小, 最大]。最小・最大は、int なら値、text なら文字数、ips なら個数 */
+function config_schema(): array
+{
+    return [
+        'AMEZO'           => ['text', '＠あめぞう', 0, 40],
+        'URLBASE'         => ['url',  'http://ame.x0.com/', 0, 200],
+        'ADMIN'           => ['text', 'サポート', 1, 20],
+        'POST_INTERVAL'   => ['int',  5, 0, 3600],        // 同じ板での連投制限 (秒)
+        'GLOBAL_WINDOW'   => ['int',  180, 0, 86400],     // 同じ IP の新規スレッド作成の間隔 (秒)
+        'MAX_THREADS'     => ['int',  200, 0, 100000],    // これを超えた古いスレッドは o数字.html に退避 (0 なら退避しない)
+        'PAGE_CACHE'      => ['int',  10, 0, 3600],       // 「次のページ」のファイルを再利用する秒数
+        'MAX_POST_BYTES'  => ['int',  7500, 1000, 1000000],
+        'SUBJ_MAX'        => ['int',  45, 1, 500],
+        'NAME_MAX'        => ['int',  25, 1, 200],
+        'MAIL_MAX'        => ['int',  50, 1, 500],
+        'COMM_MAX'        => ['int',  400, 1, 10000],
+        'COMM_LINES_MAX'  => ['int',  20, 1, 1000],
+        'HASH_ITERATIONS' => ['int',  100000, 1000, 5000000],
+        'TRUSTED_PROXIES' => ['ips',  ['127.0.0.1', '::1'], 0, 16],
+        'JUMP_ENABLED'    => ['bool', true, 0, 1],        // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする
+    ];
 }
+
+/** 1つの値を検査する。通れば [true, 型に直した値]、外れれば [false, 理由] */
+function config_check(string $type, mixed $v, int $min, int $max): array
+{
+    switch ($type) {
+        case 'int':
+            if (!is_string($v) || !preg_match('/^-?\d{1,12}$/D', trim($v))) return [false, '整数ではありません'];
+            $n = (int)trim($v);
+            return ($n < $min || $n > $max) ? [false, "{$min}〜{$max} の範囲外です"] : [true, $n];
+        case 'bool':
+            $l = is_string($v) ? strtolower(trim($v)) : '';
+            if (in_array($l, ['1', 'true', 'yes', 'on'], true)) return [true, true];
+            if (in_array($l, ['0', 'false', 'no', 'off'], true)) return [true, false];
+            return [false, 'true / false ではありません'];
+        case 'text':   // 画面にそのまま出す文字列。HTML や展開に使われうる文字は入れさせない
+            if (!is_string($v) || !mb_check_encoding($v, 'UTF-8')) return [false, '文字列ではありません'];
+            if (preg_match('/[\x00-\x1f\x7f<>"\'&$\\\\]/', $v)) return [false, '使えない文字 (制御文字 < > " \' & $ \\) を含みます'];
+            $len = mb_strlen($v, 'UTF-8');
+            return ($len < $min || $len > $max) ? [false, "{$min}〜{$max} 文字ではありません"] : [true, $v];
+        case 'url':
+            if (!is_string($v) || strlen($v) > $max || ($v !== '' && !preg_match('#^https?://[A-Za-z0-9][A-Za-z0-9.\-:/_]*$#D', $v))) {
+                return [false, 'http:// か https:// で始まる URL ではありません'];
+            }
+            return [true, $v];
+        case 'ips':
+            if ($v === '') return [true, []];                       // 「TRUSTED_PROXIES =」 は、どのプロキシも信用しない
+            if (!is_array($v) || count($v) > $max) return [false, 'IP アドレスの並びではありません'];
+            foreach ($v as $ip) {
+                if (!is_string($ip) || !filter_var(trim($ip), FILTER_VALIDATE_IP)) return [false, 'IP アドレスではない値があります'];
+            }
+            return [true, array_values(array_map('trim', $v))];
+    }
+    return [false, '未対応の型です'];
+}
+
+/** config.ini を読み、検査を通った値だけを返す。無視した値と理由は $errors に入れる */
+function config_load(string $file, array &$errors = []): array
+{
+    if (!is_file($file)) return [];
+    // INI_SCANNER_RAW: ${…} の展開や、定数名の置き換えをさせない (値はすべて文字列で来るので、自分で型を検査する)
+    $raw = @parse_ini_file($file, false, INI_SCANNER_RAW);
+    if ($raw === false) {
+        $errors[] = '読み込めません (書き方の誤り)';
+        return [];
+    }
+    $schema = config_schema();
+    $out = [];
+    foreach ($raw as $k => $v) {
+        if (!isset($schema[$k])) { $errors[] = "不明なキー: {$k}"; continue; }
+        [$ok, $val] = config_check($schema[$k][0], $v, $schema[$k][2], $schema[$k][3]);
+        if ($ok) $out[$k] = $val;
+        else $errors[] = "{$k}: {$val}";
+    }
+    return $out;
+}
+
+$_cfg_errors = [];
+$_cfg = config_load(__DIR__ . '/config.ini', $_cfg_errors);
+foreach ($_cfg_errors as $_e) error_log("amezo: config.ini の {$_e} (無視して、既定値を使います)");
+if (is_file(__DIR__ . '/config.php')) error_log('amezo: config.php は読み込みません (PHP ファイルは自動で実行されるため)。config.ini に移してください');
+foreach (config_schema() as $_k => $_spec) {
+    defined($_k) || define($_k, $_cfg[$_k] ?? $_spec[1]);            // テストなどで先に define() された値は、そのまま使う
+}
+unset($_cfg_errors, $_cfg, $_e, $_k, $_spec);
 
 // ---- 公開後に変えてはいけない仕様 (変えるとトリップ/IDが全員変わる) ----------
 const TRIP_CTX      = '';          // トリップ計算の接頭辞。空 = Python 版と同じトリップ

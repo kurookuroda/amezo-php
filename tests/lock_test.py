@@ -1,5 +1,5 @@
 # 鍵つきスレッドの結合テスト (PHP 版だけ)。
-# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動、config.php で POST_INTERVAL/GLOBAL_WINDOW=0、
+# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動、config.ini で POST_INTERVAL=0, GLOBAL_WINDOW=0、
 #       管理用パスワード adminpw の delpass.txt、板 adm と main がある
 import os, re, sys, time, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor
